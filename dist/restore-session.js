@@ -99,16 +99,34 @@ async function discover(issuer, http) {
     const discoveryResponse = await oauth.discoveryRequest(issuer, http);
     return oauth.processDiscoveryResponse(issuer, discoveryResponse);
 }
-/** Resolve the OAuth client the SAME way the original login did (static or dynamic). */
-async function resolveClient(authorizationServer, options, http) {
-    if (options.clientId !== undefined) {
+/**
+ * Resolve the OAuth client a refresh grant must run as. A refresh token is
+ * CLIENT-BOUND (RFC 6749 §6 / §10.4): it can only be redeemed by the same client
+ * that obtained it. So we reuse the original client identity — `options.clientId`
+ * (the app's static Client Identifier Document URL, if it used one) OR the
+ * `clientId` the original login PERSISTED into the session record (which, for the
+ * dynamic-registration path, is the server-assigned `client_id`). We perform a
+ * FRESH dynamic registration ONLY when neither is available — a brand-new client
+ * has no claim to a previously-issued refresh token, so reusing the stored id is
+ * what keeps a dynamic-login user restorable instead of failing `invalid_client`
+ * (roborev finding). All paths are public browser clients (`none` token-endpoint
+ * auth); the persisted refresh token's DPoP-binding (not the client secret) is what
+ * authorises the grant.
+ */
+async function resolveClient(authorizationServer, options, stored, http) {
+    const clientId = options.clientId ?? stored.clientId;
+    if (clientId !== undefined && clientId !== "") {
         return {
-            client_id: options.clientId,
+            client_id: clientId,
             token_endpoint_auth_method: "none",
             ...(options.callbackUri ? { redirect_uris: [options.callbackUri] } : {}),
             response_types: ["code"],
         };
     }
+    // No persisted/static client id — fall back to a fresh dynamic registration. This
+    // only succeeds against servers whose refresh tokens are not strictly bound to the
+    // original registration; it is the best available behaviour for the rare case of a
+    // dynamic login that never persisted its client id.
     const registrationResponse = await oauth.dynamicClientRegistrationRequest(authorizationServer, options.callbackUri ? { redirect_uris: [options.callbackUri] } : {}, http);
     return oauth.processDynamicClientRegistrationResponse(registrationResponse);
 }
@@ -162,7 +180,7 @@ export async function restoreSession(options) {
     try {
         const http = httpOptions(issuer, options);
         const authorizationServer = await discover(issuer, http);
-        const clientRegistration = await resolveClient(authorizationServer, options, http);
+        const clientRegistration = await resolveClient(authorizationServer, options, stored, http);
         // Reattach the PERSISTED, non-extractable DPoP key — the refresh-grant proof
         // must be signed by the key the token is bound to (RFC 9449 §4.3).
         const dpopHandle = oauth.DPoP(clientRegistration, stored.dpopKey);

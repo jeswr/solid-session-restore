@@ -8,11 +8,11 @@
 // The CORE is everything below. The THIN per-app wiring (the provider hook +
 // the `runSilentRestore` mount effect) stays in each app — see the README.
 // ── Credential-free remembered-account pointer (localStorage; key injectable) ──
-export { DEFAULT_REMEMBERED_ACCOUNT_KEY, RememberedAccount, } from "./remembered-account";
+export { DEFAULT_REMEMBERED_ACCOUNT_KEY, RememberedAccount, } from "./remembered-account.js";
 // ── The DPoP-bound refresh-token-grant restore helper + lifecycle ──
-export { clearPersisted, forgetPersisted, hasPersisted, isInvalidGrantError, restoreSession, } from "./restore-session";
+export { clearPersisted, forgetPersisted, hasPersisted, isInvalidGrantError, restoreSession, } from "./restore-session.js";
 // ── Durable, WebID/issuer-scoped credential store (IndexedDB; DB name injectable) ──
-export { DEFAULT_DB_NAME, IndexedDbSessionStore, indexedDbAvailable, } from "./session-persistence";
+export { DEFAULT_DB_NAME, IndexedDbSessionStore, indexedDbAvailable, } from "./session-persistence.js";
 // ── The PURE mount-time restore decision + keep/drop-pointer matrix ──
-export { decideSilentRestore, shouldDropRememberedPointer, webIdsEqual, } from "./session-restore";
+export { decideSilentRestore, shouldDropRememberedPointer, webIdsEqual, } from "./session-restore.js";
 //# sourceMappingURL=index.js.map

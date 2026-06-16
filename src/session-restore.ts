@@ -30,7 +30,7 @@
 // allowed to degrade. This is the cross-app invariant: reopening must not bounce
 // a fully-restored user to the login screen on a transient profile blip.
 
-import type { RememberedAccountRecord } from "./remembered-account";
+import type { RememberedAccountRecord } from "./remembered-account.js";
 
 /**
  * Why a `login` decision was reached — drives whether the caller should DROP the

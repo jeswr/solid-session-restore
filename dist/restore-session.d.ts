@@ -1,5 +1,5 @@
 import * as oauth from "oauth4webapi";
-import type { SessionStore } from "./session-persistence";
+import type { SessionStore } from "./session-persistence.js";
 /**
  * Whether a refresh-grant error is a DEFINITIVE `invalid_grant` — the refresh
  * token is expired / revoked / rotation-reuse-detected, so it is dead and the

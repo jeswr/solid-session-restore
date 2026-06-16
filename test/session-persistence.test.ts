@@ -12,7 +12,7 @@ import {
   IndexedDbSessionStore,
   indexedDbAvailable,
   type PersistedSession,
-} from "../src/session-persistence";
+} from "../src/session-persistence.js";
 
 // ── A minimal but faithful in-memory IndexedDB double ────────────────────────
 // It implements just the slice IndexedDbSessionStore uses: open() with

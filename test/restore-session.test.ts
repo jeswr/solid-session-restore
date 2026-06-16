@@ -23,7 +23,7 @@
 //
 // The whole OAuth/DPoP stack is mocked so this runs with no browser + no network.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { PersistedSession, SessionStore } from "../src/session-persistence";
+import type { PersistedSession, SessionStore } from "../src/session-persistence.js";
 
 // A switch each test sets so the next refresh "returns" a chosen identity/token.
 const authState = {
@@ -36,6 +36,11 @@ const authState = {
 const refreshMock = vi.hoisted(() => ({
   grantOpts: [] as Array<{ DPoP?: unknown }>,
   grantTokens: [] as string[],
+  // The client_id the grant ran as (asserts client-binding — finding 1).
+  grantClientIds: [] as Array<string | undefined>,
+  // How many times a FRESH dynamic registration was attempted (should be 0 when a
+  // client id is known — a refresh token is client-bound, RFC 6749 §6).
+  dynamicRegistrations: 0,
   // When set, the next refreshTokenGrantRequest rejects (a dead/transient token).
   reject: null as Error | null,
   // When true, the FIRST grant throws a DPoP-nonce error (retried once).
@@ -69,13 +74,17 @@ vi.mock("oauth4webapi", () => {
       code_challenge_methods_supported: ["S256"],
       scopes_supported: ["openid", "webid", "offline_access"],
     })),
-    dynamicClientRegistrationRequest: vi.fn(async () => ({})),
+    dynamicClientRegistrationRequest: vi.fn(async () => {
+      refreshMock.dynamicRegistrations += 1;
+      return {};
+    }),
     processDynamicClientRegistrationResponse: vi.fn(async () => ({
-      client_id: "dynamic-client",
+      client_id: "freshly-registered-client",
       token_endpoint_auth_method: "none",
     })),
     refreshTokenGrantRequest: vi.fn(async (..._args: unknown[]) => {
-      // arg index 3 is the refresh token redeemed; index 4 is the request options.
+      // arg index 1 is the client; index 3 the refresh token; index 4 the options.
+      refreshMock.grantClientIds.push((_args[1] as { client_id?: string } | undefined)?.client_id);
       refreshMock.grantTokens.push(_args[3] as string);
       refreshMock.grantOpts.push((_args[4] as { DPoP?: unknown }) ?? {});
       if (refreshMock.nonceOnce && !refreshMock.nonceThrown) {
@@ -102,7 +111,7 @@ vi.mock("oauth4webapi", () => {
 });
 
 const { restoreSession, hasPersisted, forgetPersisted, clearPersisted, isInvalidGrantError } =
-  await import("../src/restore-session");
+  await import("../src/restore-session.js");
 
 const WEBID_A = "https://alice.example/profile/card#me";
 const WEBID_B = "https://bob.example/profile/card#me";
@@ -154,6 +163,8 @@ beforeEach(() => {
   authState.refreshTokenRotated = "rt-rotated";
   refreshMock.grantOpts.length = 0;
   refreshMock.grantTokens.length = 0;
+  refreshMock.grantClientIds.length = 0;
+  refreshMock.dynamicRegistrations = 0;
   refreshMock.reject = null;
   refreshMock.nonceOnce = false;
   refreshMock.nonceThrown = false;
@@ -308,6 +319,62 @@ describe("restoreSession — silent refresh-token-grant restore (no popup)", () 
     refreshMock.reject = Object.assign(new Error("invalid_client"), { error: "invalid_client" });
     expect(await restoreSession({ store, issuer: ISSUER, ...CLIENT_OPTS })).toBeUndefined();
     expect(store.map.get(ISSUER.href)?.refreshToken).toBe("rt-A"); // not cleared
+  });
+});
+
+describe("client-binding — a refresh token is redeemed as its OWN client (roborev finding 1)", () => {
+  it("runs the grant as the STATIC clientId when options.clientId is supplied (no re-registration)", async () => {
+    const store = makeStore();
+    await seed(store); // stored.clientId = the static clientid.jsonld
+    await restoreSession({
+      store,
+      issuer: ISSUER,
+      clientId: "https://app.example/clientid.jsonld",
+    });
+    expect(refreshMock.grantClientIds).toEqual(["https://app.example/clientid.jsonld"]);
+    expect(refreshMock.dynamicRegistrations).toBe(0);
+  });
+
+  it("REUSES the PERSISTED clientId for a dynamic-login restore (does NOT re-register a fresh client)", async () => {
+    // A dynamic login persisted its server-assigned client_id. On restore — with NO
+    // options.clientId — the grant MUST run as that persisted client (a refresh token
+    // is client-bound); registering a fresh client would fail invalid_client.
+    const store = makeStore();
+    await seed(store, { clientId: "server-assigned-dynamic-client-id" });
+    const restored = await restoreSession({ store, issuer: ISSUER }); // no options.clientId
+    expect(restored?.webId).toBe(WEBID_A);
+    expect(refreshMock.grantClientIds).toEqual(["server-assigned-dynamic-client-id"]);
+    // The bug this guards: a fresh dynamic registration on every restore.
+    expect(refreshMock.dynamicRegistrations).toBe(0);
+  });
+
+  it("options.clientId takes precedence over a stored clientId (the app re-pins its static id)", async () => {
+    const store = makeStore();
+    await seed(store, { clientId: "stale-stored-id" });
+    await restoreSession({
+      store,
+      issuer: ISSUER,
+      clientId: "https://app.example/clientid.jsonld",
+    });
+    expect(refreshMock.grantClientIds).toEqual(["https://app.example/clientid.jsonld"]);
+    expect(refreshMock.dynamicRegistrations).toBe(0);
+  });
+
+  it("falls back to a FRESH dynamic registration ONLY when neither option nor stored clientId exists", async () => {
+    const store = makeStore();
+    // Seed an entry with NO clientId field at all (a dynamic login that never
+    // persisted its client id — the only case a fresh registration is justified).
+    store.map.set(ISSUER.href, {
+      issuer: ISSUER.href,
+      webId: WEBID_A,
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+    });
+    const restored = await restoreSession({ store, issuer: ISSUER }); // no options.clientId
+    expect(restored?.webId).toBe(WEBID_A);
+    // The only path that legitimately registers fresh.
+    expect(refreshMock.dynamicRegistrations).toBe(1);
+    expect(refreshMock.grantClientIds).toEqual(["freshly-registered-client"]);
   });
 });
 

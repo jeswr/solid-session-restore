@@ -14,7 +14,7 @@ import {
   type RememberedAccount,
   shouldDropRememberedPointer,
   webIdsEqual,
-} from "../src/session-restore";
+} from "../src/session-restore.js";
 
 const WEBID_A = "https://alice.example/profile/card#me";
 const WEBID_B = "https://bob.example/profile/card#me";

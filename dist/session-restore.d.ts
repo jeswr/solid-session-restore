@@ -1,4 +1,4 @@
-import type { RememberedAccountRecord } from "./remembered-account";
+import type { RememberedAccountRecord } from "./remembered-account.js";
 /**
  * Why a `login` decision was reached — drives whether the caller should DROP the
  * remembered-account pointer (a doomed retry) or KEEP it (a transient blip the

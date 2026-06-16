@@ -13,7 +13,7 @@ export {
   DEFAULT_REMEMBERED_ACCOUNT_KEY,
   RememberedAccount,
   type RememberedAccountRecord,
-} from "./remembered-account";
+} from "./remembered-account.js";
 // ── The DPoP-bound refresh-token-grant restore helper + lifecycle ──
 export {
   clearPersisted,
@@ -23,7 +23,7 @@ export {
   type RestoredSession,
   type RestoreSessionOptions,
   restoreSession,
-} from "./restore-session";
+} from "./restore-session.js";
 // ── Durable, WebID/issuer-scoped credential store (IndexedDB; DB name injectable) ──
 export {
   DEFAULT_DB_NAME,
@@ -32,7 +32,7 @@ export {
   indexedDbAvailable,
   type PersistedSession,
   type SessionStore,
-} from "./session-persistence";
+} from "./session-persistence.js";
 // ── The PURE mount-time restore decision + keep/drop-pointer matrix ──
 export {
   type CredentialPresence,
@@ -44,4 +44,4 @@ export {
   type SilentRestoreInputs,
   shouldDropRememberedPointer,
   webIdsEqual,
-} from "./session-restore";
+} from "./session-restore.js";

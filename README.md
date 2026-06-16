@@ -155,6 +155,12 @@ Discovers the AS, **re-attaches the persisted non-extractable DPoP key**, runs t
 `refresh_token` grant (one retry on a server DPoP-nonce challenge), re-persists the
 **rotated** token, and returns the rebuilt session. Reuses `oauth4webapi` + `dpop`.
 
+A refresh token is **client-bound** (RFC 6749 §6), so the grant runs as the original
+client: `clientId` if you pass one, else the `clientId` the login **persisted** into
+the session record (for the dynamic-registration path, the server-assigned id). A
+fresh dynamic registration is performed **only** when neither is available — a brand
+new client cannot redeem a previously-issued refresh token.
+
 - `RestoredSession`, `RestoreSessionOptions`.
 - Lifecycle: `forgetPersisted(store, issuer)` / `clearPersisted(store, issuer)`
   (logout), `hasPersisted(store, issuer)` (tri-state: `present`/`absent`/`unknown`),

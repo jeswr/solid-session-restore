@@ -10,7 +10,7 @@
 // Each test installs a faithful in-memory Storage double on globalThis (Node's test
 // runtime has no localStorage).
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { DEFAULT_REMEMBERED_ACCOUNT_KEY, RememberedAccount } from "../src/remembered-account";
+import { DEFAULT_REMEMBERED_ACCOUNT_KEY, RememberedAccount } from "../src/remembered-account.js";
 
 const WEBID_A = "https://alice.example/profile/card#me";
 const WEBID_B = "https://bob.example/profile/card#me";
