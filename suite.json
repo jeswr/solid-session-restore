@@ -1,0 +1,21 @@
+{
+  "$schema": "https://raw.githubusercontent.com/jeswr/full-solid-ecosystem/main/tracking/schema/suite.schema.json",
+  "id": "solid-session-restore",
+  "kind": "package",
+  "name": "Solid Session Restore",
+  "repo": "https://github.com/jeswr/solid-session-restore",
+  "category": "identity",
+  "maturity": "alpha",
+  "visibility": "public",
+  "stack": {
+    "language": "TypeScript",
+    "runtime": "Browser (IndexedDB / localStorage / WebCrypto)",
+    "crypto": "non-extractable DPoP CryptoKeyPair; RFC 9449 sender-constrained refresh-token grant",
+    "auth": "Solid-OIDC silent session restore (refresh_token grant; fail-closed; WebID-scoped)",
+    "modules": "ESM",
+    "test": "vitest",
+    "lint": "@biomejs/biome"
+  },
+  "dependsOn": [],
+  "federation": null
+}

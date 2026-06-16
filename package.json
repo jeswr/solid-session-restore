@@ -1,0 +1,69 @@
+{
+  "name": "@jeswr/solid-session-restore",
+  "version": "0.1.0",
+  "description": "Framework-agnostic, security-audited silent Solid-OIDC session restore for browser apps: a WebID/issuer-scoped IndexedDB store for the DPoP-bound refresh token + non-extractable key, a credential-free remembered-account pointer, the pure restore decision (fail-closed, WebID-scoped, clear-only-on-invalid_grant), and a DPoP-bound refresh-token-grant restore helper. Extracted from the proven pod-mail pilot.",
+  "type": "module",
+  "license": "MIT",
+  "author": "Jesse Wright",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jeswr/solid-session-restore.git"
+  },
+  "homepage": "https://github.com/jeswr/solid-session-restore#readme",
+  "bugs": {
+    "url": "https://github.com/jeswr/solid-session-restore/issues"
+  },
+  "keywords": [
+    "solid",
+    "solid-oidc",
+    "session-restore",
+    "silent-login",
+    "refresh-token",
+    "dpop",
+    "rfc9449",
+    "rfc6749",
+    "oauth",
+    "indexeddb",
+    "browser"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "lint": "biome check src test",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check:dist": "node scripts/check-dist.mjs",
+    "gate": "npm run lint && npm run typecheck && npm test && npm run build && npm run check:dist"
+  },
+  "dependencies": {
+    "dpop": "^2.1.1",
+    "oauth4webapi": "^3.8.6"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.9.0",
+    "vitest": "^4.0.0"
+  }
+}
