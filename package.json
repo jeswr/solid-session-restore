@@ -54,7 +54,8 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "check:dist": "node scripts/check-dist.mjs",
-    "gate": "npm run lint && npm run typecheck && npm test && npm run build && npm run check:dist"
+    "check:lockfile-transport": "node scripts/check-lockfile-transport.mjs",
+    "gate": "npm run lint && npm run typecheck && npm test && npm run build && npm run check:dist && npm run check:lockfile-transport"
   },
   "dependencies": {
     "dpop": "^2.1.1",
