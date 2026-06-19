@@ -1,5 +1,5 @@
 import * as oauth from "oauth4webapi";
-import type { SessionStore } from "./session-persistence.js";
+import type { SessionStore, TokenEndpointAuthMethod } from "./session-persistence.js";
 /**
  * Whether a refresh-grant error is a DEFINITIVE `invalid_grant` — the refresh
  * token is expired / revoked / rotation-reuse-detected, so it is dead and the
@@ -47,6 +47,27 @@ export interface RestoreSessionOptions {
      * fallback (when {@link clientId} is absent). Ignored for the static-client path.
      */
     callbackUri?: string;
+    /**
+     * OPTIONAL confidential-client secret to authenticate the refresh grant with (RFC
+     * 6749 §2.3.1). LEAVE UNSET for a PUBLIC client (the common case — static Client
+     * Identifier Document / PKCE; the grant uses `none`). Set it only for a
+     * CONFIDENTIAL client (the ESS/PodSpaces path), AND ONLY ALONGSIDE a confidential
+     * {@link tokenEndpointAuthMethod} (this option or the persisted one) — the secret is
+     * IGNORED unless a confidential method resolves (the resolved method defaults to
+     * `none`, which sends no secret). When set it OVERRIDES the persisted
+     * {@link PersistedSession.clientSecret} (an app re-supplying a known secret); when
+     * unset the helper falls back to the persisted secret. NEVER logged.
+     */
+    clientSecret?: string;
+    /**
+     * OPTIONAL token-endpoint client-authentication method (RFC 6749 §2.3 / OIDC Core
+     * §9). Defaults to the persisted {@link PersistedSession.tokenEndpointAuthMethod},
+     * else `"none"` (public client). Only consulted when a secret resolves (this
+     * option's {@link clientSecret} or the persisted one): `"client_secret_basic"` /
+     * `"client_secret_post"` choose how the secret is presented; `"none"` ignores any
+     * secret. An override here takes precedence over the persisted method.
+     */
+    tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
     /**
      * Enable oauth4webapi's `allowInsecureRequests` for `localhost` / `127.0.0.1`
      * issuers only (dev CSS over HTTP). Remote HTTPS issuers are unaffected, and

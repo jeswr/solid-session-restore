@@ -1,4 +1,15 @@
 /**
+ * The OAuth token-endpoint client-authentication method a persisted session must
+ * use on its refresh-token grant (RFC 6749 §2.3 / OIDC Core §9). Only the methods
+ * this package supports are listed:
+ *  - `"none"` — PUBLIC client (the default; PKCE/DPoP, no secret). Static Client
+ *    Identifier Documents and PKCE dynamic clients are all `none` here.
+ *  - `"client_secret_basic"` — CONFIDENTIAL client; the secret rides in an HTTP
+ *    `Basic` Authorization header. The ESS/PodSpaces dynamic-registration path.
+ *  - `"client_secret_post"` — CONFIDENTIAL client; the secret rides in the form body.
+ */
+export type TokenEndpointAuthMethod = "none" | "client_secret_basic" | "client_secret_post";
+/**
  * One persisted session, keyed by issuer. The access token is deliberately
  * ABSENT — only the long-lived, key-bound refresh credential is durable.
  */
@@ -20,6 +31,25 @@ export interface PersistedSession {
     dpopKey: CryptoKeyPair;
     /** The Client Identifier Document URL used, when the session was static-client. */
     clientId?: string;
+    /**
+     * The token-endpoint client-authentication method this session's refresh grant
+     * MUST use (RFC 6749 §2.3 / OIDC Core §9). Absent (or `"none"`) for the common
+     * PUBLIC-client case — the grant then uses `none` auth. Set to
+     * `"client_secret_basic"` / `"client_secret_post"` only for a CONFIDENTIAL client
+     * that registered with a secret (the ESS/PodSpaces dynamic path); {@link clientSecret}
+     * must then also be present. See the module threat model.
+     */
+    tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
+    /**
+     * The CONFIDENTIAL client's secret (RFC 6749 §2.3.1). Present ONLY for a
+     * `client_secret_basic` / `client_secret_post` session (the rare ESS/PodSpaces
+     * dynamic-registration path); ABSENT for the common public-client case. Stored in
+     * the same origin/app-scoped IndexedDB as the refresh token, under the same
+     * fail-closed / clear-on-logout discipline, and NEVER logged — see the module
+     * threat model (it is no worse than persisting the refresh token it authorises,
+     * and the grant is also DPoP-bound).
+     */
+    clientSecret?: string;
     /** Epoch ms the (now-discarded) access token would have expired — advisory. */
     expiresAt?: number;
 }

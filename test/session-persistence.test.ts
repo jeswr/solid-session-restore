@@ -191,6 +191,28 @@ describe("IndexedDbSessionStore — the durable refresh-token store contract", (
     expect(await store.get(session.issuer)).toBeUndefined();
   });
 
+  it("round-trips the optional CONFIDENTIAL-client fields (tokenEndpointAuthMethod + clientSecret)", async () => {
+    // The ESS/PodSpaces path persists a confidential client's auth method + secret so
+    // a closed-tab reopen can authenticate the refresh grant. They must survive the
+    // IndexedDB structured-clone round-trip like the rest of the record.
+    const factory = new FakeIDBFactory();
+    const store = new IndexedDbSessionStore({ factory: factory as unknown as IDBFactory });
+    const session: PersistedSession = {
+      issuer: "https://login.inrupt.com/",
+      webId: "https://alice.example/profile/card#me",
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+      clientId: "ess-dynamic-client",
+      tokenEndpointAuthMethod: "client_secret_basic",
+      clientSecret: "s3cr3t",
+    };
+    await store.put(session);
+    const got = await store.get(session.issuer);
+    expect(got?.tokenEndpointAuthMethod).toBe("client_secret_basic");
+    expect(got?.clientSecret).toBe("s3cr3t");
+    expect(got?.clientId).toBe("ess-dynamic-client");
+  });
+
   it("creates the object store exactly once (onupgradeneeded), reused across opens", async () => {
     const factory = new FakeIDBFactory();
     const store = new IndexedDbSessionStore({ factory: factory as unknown as IDBFactory });

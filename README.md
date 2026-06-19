@@ -70,11 +70,66 @@ These are exactly the pilot's, pinned by the test suite:
 - **Fail-closed.** Every "nothing to restore / could not rebuild / could not verify"
   path falls back to login. The decision never asserts a session it could not
   actually rebuild.
-- **No access token persisted; the refresh token is never logged.** Only the
-  long-lived, key-bound credential is durable.
+- **No access token persisted; the refresh token (and any client secret) is never
+  logged.** Only the long-lived, key-bound credential is durable.
+- **Public by default; a client secret only when one exists.** The grant uses `none`
+  client auth unless the session is a **confidential** client (a persisted
+  `client_secret` — the ESS/PodSpaces path), in which case the secret is presented and
+  re-persisted across rotation under the same fail-closed / clear-on-logout discipline.
+  A confidential method with **no** secret **fails closed** (never downgrades to `none`).
 - **Per-app store + pointer.** The IndexedDB DB name and the localStorage key are
   **injectable** per app, so two apps on a shared origin never share a session store
   or a pointer.
+
+## Spec-compliant vs bespoke per-server
+
+This package targets the **Solid-OIDC** profile of OpenID Connect / OAuth 2.0. The
+restore flow is almost entirely **standard**; a small, clearly-marked set of behaviours
+exists only to interoperate with specific servers' non-conformances. This section draws
+that line explicitly (the maintainer asked for it on
+[#1](https://github.com/jeswr/solid-session-restore/issues/1)).
+
+### Standard — what follows the OIDC / OAuth / Solid-OIDC specs
+
+| Behaviour | Spec |
+|---|---|
+| Restore via the **`refresh_token` grant** (a token-endpoint `POST`, no popup/iframe) | [RFC 6749 §6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6) (Refreshing an Access Token) |
+| **Refresh tokens are client-bound** — redeemed only by the issuing client; we reuse the original `client_id` | [RFC 6749 §6](https://www.rfc-editor.org/rfc/rfc6749.html#section-6) + [§10.4](https://www.rfc-editor.org/rfc/rfc6749.html#section-10.4) |
+| **Refresh-token rotation** — adopt + re-persist a server-issued new refresh token | [OAuth 2.0 Security BCP / RFC 9700 §4.14.2](https://www.rfc-editor.org/rfc/rfc9700.html#section-4.14.2) |
+| Public-client default — **`none`** token-endpoint auth (PKCE / DPoP, no secret) | [RFC 6749 §2.3](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3) · [OIDC Core §9](https://openid.net/specs/openid-connect-core-1_0.html#ClientAuthentication) |
+| Confidential-client **`client_secret_basic`** — secret in an HTTP `Basic` header | [RFC 6749 §2.3.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1) · [OIDC Core §9](https://openid.net/specs/openid-connect-core-1_0.html#ClientAuthentication) |
+| Confidential-client **`client_secret_post`** — secret in the form body | [RFC 6749 §2.3.1](https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1) · [OIDC Core §9](https://openid.net/specs/openid-connect-core-1_0.html#ClientAuthentication) |
+| **DPoP** sender-constrained proof on the grant, signed by the bound key; one **`use_dpop_nonce`** retry | [RFC 9449 §4.3 + §8](https://www.rfc-editor.org/rfc/rfc9449.html) |
+| **PKCE** at login (S256), DPoP key generated `extractable: false` | [RFC 7636](https://www.rfc-editor.org/rfc/rfc7636.html) (login is the app's; this package consumes its output) |
+| **OIDC Discovery** of the authorization server metadata before the grant | [OIDC Discovery 1.0](https://openid.net/specs/openid-connect-discovery-1_0.html) |
+| **Dynamic Client Registration** fallback when no `client_id` was persisted; the server-assigned `client_id` is then persisted (refresh tokens are client-bound) | [RFC 7591](https://www.rfc-editor.org/rfc/rfc7591.html) · [OIDC Registration 1.0](https://openid.net/specs/openid-connect-registration-1_0.html) |
+| A registration that issues a **secret** with `token_endpoint_auth_method` **omitted** defaults to `client_secret_basic` | [RFC 7591 §2](https://www.rfc-editor.org/rfc/rfc7591.html#section-2) (default) · [OIDC Registration 1.0 §2](https://openid.net/specs/openid-connect-registration-1_0.html#ClientMetadata) |
+| The **WebID** is read from the id_token `webid` claim (Solid-OIDC), falling back to `sub` | [Solid-OIDC](https://solidproject.org/TR/oidc) |
+| **`invalid_grant`** = a definitively dead refresh token (cleared); other errors are transient (preserved) | [RFC 6749 §5.2](https://www.rfc-editor.org/rfc/rfc6749.html#section-5.2) |
+
+The heavy lifting (discovery, PKCE, the DPoP proof + nonce handshake, the grant
+requests/responses, all client-auth methods) is delegated to **`oauth4webapi`** + the
+**`dpop`** package — this repo does not hand-roll OAuth.
+
+### Bespoke — per-server workarounds (deviations from the spec)
+
+These exist **only** because specific Solid servers deviate. Each is narrowly scoped so
+it never affects a conformant server.
+
+| Workaround | Why | Scope |
+|---|---|---|
+| **Inrupt ESS / PodSpaces `client_secret_basic` is sent WITHOUT RFC 6749 §2.3.1 form-url-encoding** — `btoa("client_id:secret")` on the raw values. | ESS (`login.inrupt.com`) **rejects** the spec-encoded form ([RFC 6749 §2.3.1 / App. B](https://www.rfc-editor.org/rfc/rfc6749.html#appendix-B) say the `Basic` userid/password are the `application/x-www-form-urlencoded` client_id/secret). For every **other** issuer the spec-compliant `oauth4webapi.ClientSecretBasic` is used. | Keyed on the discovered issuer's **exact hostname** being `login.inrupt.com` (a look-alike issuer that merely contains the substring is not matched). |
+| **Persisting a `client_secret` at all** (for the confidential dynamic path). | Strict OAuth treats a refresh-token grant as a fresh token-endpoint call needing client auth; a closed-tab reopen has no live secret, so to restore a confidential dynamic client we must persist it. A **public** client (the suite's normal config — a static Client Identifier Document) persists no secret and this never applies. | Present only when `tokenEndpointAuthMethod` is confidential. |
+
+Two further server quirks are handled in the **app's login layer**, not in this restore
+package (noted here for completeness because they shape what restore consumes):
+
+- **NSS / some ESS variants omit the DPoP `use_dpop_nonce` / id_token `nonce`** — the
+  login provider expects-no-nonce for those issuers (e.g. `solidweb.org`,
+  `datapod.igrant.io`). Restore inherits a correct session from login and does not
+  re-implement this.
+- **`prompt=none` silent-auth quirks** (NSS/Trinpod) belong to the interactive login,
+  not the refresh-token restore path this package owns.
 
 ## The exported CORE API
 
@@ -90,8 +145,12 @@ the transaction **commit** (`tx.oncomplete`), not the request — a credential i
 never reported persisted before it is durable. Construct only in the browser; guard
 with `indexedDbAvailable()`.
 
-- `PersistedSession` — `{ issuer, webId, refreshToken, dpopKey: CryptoKeyPair, clientId?, expiresAt? }`
-  (no access token, ever).
+- `PersistedSession` — `{ issuer, webId, refreshToken, dpopKey: CryptoKeyPair, clientId?, tokenEndpointAuthMethod?, clientSecret?, expiresAt? }`
+  (no access token, ever). `tokenEndpointAuthMethod` + `clientSecret` are present **only**
+  for a confidential client (the ESS/PodSpaces path — see
+  [Spec-compliant vs bespoke](#spec-compliant-vs-bespoke-per-server)); a public client
+  persists neither.
+- `TokenEndpointAuthMethod` — `"none" | "client_secret_basic" | "client_secret_post"`.
 - `SessionStore` — the injectable contract (supply an in-memory double in tests).
 - `DEFAULT_DB_NAME`, `IndexedDbSessionStoreOptions`, `indexedDbAvailable()`.
 
@@ -140,15 +199,18 @@ shouldDropRememberedPointer(reason, credentialPresence); // "present" | "absent"
 
 ```ts
 const restored = await restoreSession({
-  store,                 // the SessionStore
-  issuer: new URL(iss),  // the remembered issuer
-  clientId,              // your Solid-OIDC Client Identifier Document URL (or omit → dynamic reg)
-  allowInsecureLoopback, // true only for localhost dev CSS over HTTP
-  signal,                // optional AbortSignal
-  fetch,                 // optional fetch override
+  store,                  // the SessionStore
+  issuer: new URL(iss),   // the remembered issuer
+  clientId,               // your Solid-OIDC Client Identifier Document URL (or omit → dynamic reg)
+  clientSecret,           // OPTIONAL — confidential-client secret (ESS/PodSpaces); omit for a public client
+  tokenEndpointAuthMethod,// OPTIONAL — "none" (default) | "client_secret_basic" | "client_secret_post"
+  allowInsecureLoopback,  // true only for localhost dev CSS over HTTP
+  signal,                 // optional AbortSignal
+  fetch,                  // optional fetch override
 });
 // → RestoredSession { webId, accessToken, refreshToken, dpopKey, dpopHandle, expiresAt, issuer }
-// | undefined  (nothing to restore / dead token [cleared] / transient failure [preserved])
+// | undefined  (nothing to restore / dead token [cleared] / transient failure [preserved] /
+//              confidential method with no secret [preserved, fail-closed])
 ```
 
 Discovers the AS, **re-attaches the persisted non-extractable DPoP key**, runs the
@@ -160,6 +222,20 @@ client: `clientId` if you pass one, else the `clientId` the login **persisted** 
 the session record (for the dynamic-registration path, the server-assigned id). A
 fresh dynamic registration is performed **only** when neither is available — a brand
 new client cannot redeem a previously-issued refresh token.
+
+**Client authentication** (RFC 6749 §2.3 / OIDC Core §9) defaults to `none` (a
+**public** client — static Client Identifier Document / PKCE, no secret), exactly as
+before. A **confidential** client — one whose login persisted a `clientSecret` +
+`tokenEndpointAuthMethod` of `client_secret_basic` / `client_secret_post`, or a fresh
+dynamic registration that came back confidential (the **ESS/PodSpaces** path) — presents
+that secret on the grant, and the resolved secret + method are re-persisted across
+rotation so the next reload authenticates the same way. The secret is stored under the
+same WebID/issuer-scoped IndexedDB discipline as the refresh token (fail-closed; cleared
+on logout) and **never logged**. If a confidential method is set but **no secret** is
+available, restore **fails closed** (returns `undefined`, preserving the credential) —
+it never silently downgrades to `none`. See
+[Spec-compliant vs bespoke](#spec-compliant-vs-bespoke-per-server) for exactly which of
+this is standard OIDC vs a per-server workaround.
 
 - `RestoredSession`, `RestoreSessionOptions`.
 - Lifecycle: `forgetPersisted(store, issuer)` / `clearPersisted(store, issuer)`

@@ -32,6 +32,7 @@ export {
   indexedDbAvailable,
   type PersistedSession,
   type SessionStore,
+  type TokenEndpointAuthMethod,
 } from "./session-persistence.js";
 // ── The PURE mount-time restore decision + keep/drop-pointer matrix ──
 export {

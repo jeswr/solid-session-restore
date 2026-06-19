@@ -48,6 +48,22 @@ const refreshMock = vi.hoisted(() => ({
   nonceThrown: false,
   // The DPoP handle the helper built for the refresh (asserts key continuity).
   lastDpopHandle: null as unknown,
+  // The client-auth function passed into each grant (arg index 2) — asserts WHICH
+  // auth method (none / client_secret_basic / client_secret_post) the helper chose.
+  grantClientAuths: [] as unknown[],
+  // What the dynamic-registration RESPONSE advertises (so a test can drive an
+  // ESS-style `client_secret_basic` fresh registration).
+  registrationResponse: {
+    client_id: "freshly-registered-client",
+    token_endpoint_auth_method: "none",
+  } as {
+    client_id: string;
+    token_endpoint_auth_method?: string;
+    client_secret?: string;
+  },
+  // The discovered issuer (the ESS no-url-encode workaround keys off this). Default
+  // is a non-ESS issuer; an ESS test sets it to a login.inrupt.com URL.
+  discoveredIssuer: "https://issuer.example/",
 }));
 
 vi.mock("oauth4webapi", () => {
@@ -57,7 +73,14 @@ vi.mock("oauth4webapi", () => {
   return {
     allowInsecureRequests,
     customFetch,
-    None: () => () => {},
+    // Tagged client-auth constructors so a test can identify WHICH method the helper
+    // chose (and, for client_secret_post, the secret it carried). `None` returns a
+    // distinct tagged value too. The ESS no-url-encode variant is built LOCALLY in
+    // restore-session.ts (NOT via these), so for an ESS issuer the captured clientAuth
+    // is a plain function, not one of these tags — which a test relies on.
+    None: () => ({ method: "none" }) as unknown,
+    ClientSecretBasic: (secret: string) => ({ method: "client_secret_basic", secret }) as unknown,
+    ClientSecretPost: (secret: string) => ({ method: "client_secret_post", secret }) as unknown,
     expectNoNonce: Symbol("expectNoNonce"),
     // DPoP() returns a tagged handle so tests can recognise the SAME handle reused.
     DPoP: vi.fn((_client: unknown, key: unknown) => {
@@ -68,9 +91,9 @@ vi.mock("oauth4webapi", () => {
     isDPoPNonceError: (e: unknown) => e instanceof DPoPNonceError,
     discoveryRequest: vi.fn(async () => ({})),
     processDiscoveryResponse: vi.fn(async () => ({
-      issuer: "https://issuer.example/",
-      authorization_endpoint: "https://issuer.example/auth",
-      token_endpoint: "https://issuer.example/token",
+      issuer: refreshMock.discoveredIssuer,
+      authorization_endpoint: `${refreshMock.discoveredIssuer}auth`,
+      token_endpoint: `${refreshMock.discoveredIssuer}token`,
       code_challenge_methods_supported: ["S256"],
       scopes_supported: ["openid", "webid", "offline_access"],
     })),
@@ -78,13 +101,12 @@ vi.mock("oauth4webapi", () => {
       refreshMock.dynamicRegistrations += 1;
       return {};
     }),
-    processDynamicClientRegistrationResponse: vi.fn(async () => ({
-      client_id: "freshly-registered-client",
-      token_endpoint_auth_method: "none",
-    })),
+    processDynamicClientRegistrationResponse: vi.fn(async () => refreshMock.registrationResponse),
     refreshTokenGrantRequest: vi.fn(async (..._args: unknown[]) => {
-      // arg index 1 is the client; index 3 the refresh token; index 4 the options.
+      // arg index 1 is the client; index 2 the clientAuth; index 3 the refresh token;
+      // index 4 the options.
       refreshMock.grantClientIds.push((_args[1] as { client_id?: string } | undefined)?.client_id);
+      refreshMock.grantClientAuths.push(_args[2]);
       refreshMock.grantTokens.push(_args[3] as string);
       refreshMock.grantOpts.push((_args[4] as { DPoP?: unknown }) ?? {});
       if (refreshMock.nonceOnce && !refreshMock.nonceThrown) {
@@ -169,6 +191,12 @@ beforeEach(() => {
   refreshMock.nonceOnce = false;
   refreshMock.nonceThrown = false;
   refreshMock.lastDpopHandle = null;
+  refreshMock.grantClientAuths.length = 0;
+  refreshMock.registrationResponse = {
+    client_id: "freshly-registered-client",
+    token_endpoint_auth_method: "none",
+  };
+  refreshMock.discoveredIssuer = "https://issuer.example/";
 });
 
 describe("restoreSession — silent refresh-token-grant restore (no popup)", () => {
@@ -375,6 +403,385 @@ describe("client-binding — a refresh token is redeemed as its OWN client (robo
     // The only path that legitimately registers fresh.
     expect(refreshMock.dynamicRegistrations).toBe(1);
     expect(refreshMock.grantClientIds).toEqual(["freshly-registered-client"]);
+  });
+});
+
+describe("client authentication — public default + confidential client_secret (issue #1)", () => {
+  it("PUBLIC client (no secret) authenticates the grant with `none` — the unchanged default", async () => {
+    const store = makeStore();
+    await seed(store); // no tokenEndpointAuthMethod / clientSecret persisted
+    const restored = await restoreSession({ store, issuer: ISSUER, ...CLIENT_OPTS });
+    expect(restored?.webId).toBe(WEBID_A);
+    // The grant ran with `none` client auth (no secret), exactly as before.
+    expect(refreshMock.grantClientAuths).toHaveLength(1);
+    expect(refreshMock.grantClientAuths[0]).toEqual({ method: "none" });
+    // A public client persists NO secret on the rotated re-persist.
+    const persisted = store.map.get(ISSUER.href);
+    expect(persisted?.clientSecret).toBeUndefined();
+    expect(persisted?.tokenEndpointAuthMethod).toBeUndefined();
+  });
+
+  it("CONFIDENTIAL client (persisted client_secret_basic + secret) authenticates via Basic with the secret", async () => {
+    const store = makeStore();
+    await seed(store, {
+      tokenEndpointAuthMethod: "client_secret_basic",
+      clientSecret: "s3cr3t",
+      clientId: "server-assigned-dynamic-client-id",
+    });
+    const restored = await restoreSession({ store, issuer: ISSUER });
+    expect(restored?.webId).toBe(WEBID_A);
+    // The grant authenticated with the persisted secret via client_secret_basic.
+    expect(refreshMock.grantClientAuths[0]).toEqual({
+      method: "client_secret_basic",
+      secret: "s3cr3t",
+    });
+  });
+
+  it("CONFIDENTIAL client_secret_post sends the secret in the body (per the persisted method)", async () => {
+    const store = makeStore();
+    await seed(store, {
+      tokenEndpointAuthMethod: "client_secret_post",
+      clientSecret: "s3cr3t",
+      clientId: "server-assigned-dynamic-client-id",
+    });
+    await restoreSession({ store, issuer: ISSUER });
+    expect(refreshMock.grantClientAuths[0]).toEqual({
+      method: "client_secret_post",
+      secret: "s3cr3t",
+    });
+  });
+
+  it("re-persists the confidential method + secret across a refresh-token ROTATION", async () => {
+    const store = makeStore();
+    await seed(store, {
+      tokenEndpointAuthMethod: "client_secret_basic",
+      clientSecret: "s3cr3t",
+      clientId: "server-assigned-dynamic-client-id",
+    });
+    await restoreSession({ store, issuer: ISSUER });
+    const persisted = store.map.get(ISSUER.href);
+    // The rotated token re-persist carries the confidential creds forward so the NEXT
+    // reload can authenticate the same way.
+    expect(persisted?.refreshToken).toBe("rt-rotated");
+    expect(persisted?.tokenEndpointAuthMethod).toBe("client_secret_basic");
+    expect(persisted?.clientSecret).toBe("s3cr3t");
+  });
+
+  it("a FRESH ESS-style dynamic registration that returns client_secret_basic is adopted + persisted", async () => {
+    // The headline issue-#1 case: a dynamic login whose registration came back
+    // confidential (ESS/PodSpaces). The session never persisted a clientId, so a
+    // fresh registration runs; the helper must ADOPT the returned secret + method,
+    // authenticate the grant with it, and persist it for the next reload.
+    const store = makeStore();
+    store.map.set(ISSUER.href, {
+      issuer: ISSUER.href,
+      webId: WEBID_A,
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+    });
+    refreshMock.registrationResponse = {
+      client_id: "ess-dynamic-client",
+      token_endpoint_auth_method: "client_secret_basic",
+      client_secret: "ess-secret",
+    };
+    const restored = await restoreSession({ store, issuer: ISSUER }); // no options.clientId
+    expect(restored?.webId).toBe(WEBID_A);
+    expect(refreshMock.dynamicRegistrations).toBe(1);
+    // The grant authenticated with the freshly-registered confidential secret (non-ESS
+    // issuer here → the standard ClientSecretBasic tag, not the no-url-encode variant).
+    expect(refreshMock.grantClientAuths[0]).toEqual({
+      method: "client_secret_basic",
+      secret: "ess-secret",
+    });
+    // And it is persisted so the next reload restores confidentially without re-registering.
+    const persisted = store.map.get(ISSUER.href);
+    expect(persisted?.tokenEndpointAuthMethod).toBe("client_secret_basic");
+    expect(persisted?.clientSecret).toBe("ess-secret");
+    // The SERVER-ASSIGNED client_id is persisted too (refresh tokens are client-bound —
+    // RFC 6749 §6); without it the next reload re-registers a fresh client and orphans
+    // the persisted secret (roborev High finding).
+    expect(persisted?.clientId).toBe("ess-dynamic-client");
+  });
+
+  it("persists the SERVER-ASSIGNED client_id from a fresh PUBLIC dynamic registration (client-binding)", async () => {
+    // Even for a `none` fresh registration the resolved client_id must be persisted so
+    // the next reload reuses the same client (the refresh token is client-bound). This
+    // is the public-client half of the roborev High finding.
+    const store = makeStore();
+    store.map.set(ISSUER.href, {
+      issuer: ISSUER.href,
+      webId: WEBID_A,
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+    });
+    // Default registrationResponse is { client_id: "freshly-registered-client", none }.
+    await restoreSession({ store, issuer: ISSUER });
+    expect(refreshMock.dynamicRegistrations).toBe(1);
+    expect(store.map.get(ISSUER.href)?.clientId).toBe("freshly-registered-client");
+  });
+
+  it("a fresh registration with a secret but OMITTED method defaults to client_secret_basic (OIDC/RFC 7591)", async () => {
+    // OIDC Registration 1.0 / RFC 7591 §2 default an omitted token_endpoint_auth_method
+    // to client_secret_basic. A secret-bearing registration with no method must NOT be
+    // treated as `none` (that would skip required client auth — roborev Medium).
+    const store = makeStore();
+    store.map.set(ISSUER.href, {
+      issuer: ISSUER.href,
+      webId: WEBID_A,
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+    });
+    refreshMock.registrationResponse = {
+      client_id: "ess-dynamic-client",
+      client_secret: "ess-secret",
+      // token_endpoint_auth_method intentionally OMITTED
+    };
+    const restored = await restoreSession({ store, issuer: ISSUER });
+    expect(restored?.webId).toBe(WEBID_A);
+    expect(refreshMock.grantClientAuths[0]).toEqual({
+      method: "client_secret_basic",
+      secret: "ess-secret",
+    });
+    const persisted = store.map.get(ISSUER.href);
+    expect(persisted?.tokenEndpointAuthMethod).toBe("client_secret_basic");
+    expect(persisted?.clientSecret).toBe("ess-secret");
+  });
+
+  it("FAIL-CLOSED: a fresh registration issuing a secret under an UNSUPPORTED method → undefined, no grant", async () => {
+    // A registration that hands back a secret but asks for a method we cannot honour
+    // (e.g. client_secret_jwt / private_key_jwt) must FAIL CLOSED, never silently
+    // downgrade to `none` and send the credential the wrong way.
+    const store = makeStore();
+    store.map.set(ISSUER.href, {
+      issuer: ISSUER.href,
+      webId: WEBID_A,
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+    });
+    refreshMock.registrationResponse = {
+      client_id: "ess-dynamic-client",
+      client_secret: "ess-secret",
+      token_endpoint_auth_method: "client_secret_jwt",
+    };
+    const restored = await restoreSession({ store, issuer: ISSUER });
+    expect(restored).toBeUndefined();
+    expect(refreshMock.grantClientAuths).toHaveLength(0);
+    // Credential preserved (a method we can't honour is not proof the token is dead).
+    expect(store.map.get(ISSUER.href)?.refreshToken).toBe("rt-A");
+  });
+
+  it("FAIL-CLOSED: a fresh registration with an UNSUPPORTED method and NO secret also aborts (not `none`)", async () => {
+    // A server that registers us with private_key_jwt / tls_client_auth and issues NO
+    // secret must NOT be silently treated as a public `none` client — that would
+    // mis-authenticate. Fail closed even with no secret present (roborev finding).
+    const store = makeStore();
+    store.map.set(ISSUER.href, {
+      issuer: ISSUER.href,
+      webId: WEBID_A,
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+    });
+    refreshMock.registrationResponse = {
+      client_id: "strong-auth-client",
+      token_endpoint_auth_method: "private_key_jwt",
+      // no client_secret
+    };
+    const restored = await restoreSession({ store, issuer: ISSUER });
+    expect(restored).toBeUndefined();
+    expect(refreshMock.grantClientAuths).toHaveLength(0);
+    expect(store.map.get(ISSUER.href)?.refreshToken).toBe("rt-A");
+  });
+
+  it("persists the SERVER-ASSIGNED client_id when the stored clientId is an EMPTY STRING (treated as absent)", async () => {
+    // resolveClient treats an empty stored clientId as absent (→ fresh registration);
+    // the rotation re-persist must do the same and NOT preserve the empty string,
+    // otherwise the server-assigned id is dropped (roborev finding).
+    const store = makeStore();
+    store.map.set(ISSUER.href, {
+      issuer: ISSUER.href,
+      webId: WEBID_A,
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+      clientId: "", // empty → absent
+    });
+    await restoreSession({ store, issuer: ISSUER });
+    expect(refreshMock.dynamicRegistrations).toBe(1);
+    expect(store.map.get(ISSUER.href)?.clientId).toBe("freshly-registered-client");
+  });
+
+  it("does NOT apply the ESS no-url-encode workaround to an issuer that merely CONTAINS the substring", async () => {
+    // The workaround is keyed on the EXACT hostname, so an unrelated issuer whose URL
+    // only contains `login.inrupt.com` as a path/subdomain segment uses the SPEC
+    // ClientSecretBasic, not the bespoke variant (roborev finding).
+    const store = makeStore();
+    const lookalike = new URL("https://evil.example/login.inrupt.com/oidc");
+    refreshMock.discoveredIssuer = "https://evil.example/login.inrupt.com/oidc/";
+    store.map.set(lookalike.href, {
+      issuer: lookalike.href,
+      webId: WEBID_A,
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+      tokenEndpointAuthMethod: "client_secret_basic",
+      clientSecret: "s3cr3t",
+      clientId: "some-client",
+    });
+    await restoreSession({ store, issuer: lookalike });
+    // The SPEC ClientSecretBasic tag (the mocked one), NOT the local no-url-encode fn.
+    expect(refreshMock.grantClientAuths[0]).toEqual({
+      method: "client_secret_basic",
+      secret: "s3cr3t",
+    });
+  });
+
+  it("an INRUPT-ESS issuer uses the BESPOKE no-url-encode Basic header (NOT the spec ClientSecretBasic)", async () => {
+    // The ESS workaround: for login.inrupt.com the helper builds a LOCAL clientAuth
+    // that base64s `client_id:secret` WITHOUT RFC-6749-§2.3.1 form-url-encoding. We
+    // assert (a) it is NOT the mocked spec ClientSecretBasic tag, and (b) invoking it
+    // produces the exact non-url-encoded Basic header.
+    const store = makeStore();
+    const essIssuer = new URL("https://login.inrupt.com/");
+    refreshMock.discoveredIssuer = "https://login.inrupt.com/";
+    // A client_id + secret containing chars that RFC form-url-encoding WOULD escape.
+    // Seed under the ESS issuer key (the store is keyed by issuer).
+    store.map.set(essIssuer.href, {
+      issuer: essIssuer.href,
+      webId: WEBID_A,
+      refreshToken: "rt-A",
+      dpopKey: await sampleKey(),
+      tokenEndpointAuthMethod: "client_secret_basic",
+      clientSecret: "se cr+et",
+      clientId: "client id+1",
+    });
+    await restoreSession({ store, issuer: essIssuer });
+    const clientAuth = refreshMock.grantClientAuths[0] as
+      | ((as: unknown, client: { client_id: string }, body: unknown, headers: Headers) => void)
+      | { method: string };
+    // It is the LOCAL function, not the mocked spec tag.
+    expect(typeof clientAuth).toBe("function");
+    // Invoke it and confirm the raw (non-url-encoded) Basic header.
+    const headers = new Headers();
+    (
+      clientAuth as (
+        as: unknown,
+        client: { client_id: string },
+        body: unknown,
+        headers: Headers,
+      ) => void
+    )({}, { client_id: "client id+1" }, new URLSearchParams(), headers);
+    const expected = `Basic ${btoa("client id+1:se cr+et")}`;
+    expect(headers.get("authorization")).toBe(expected);
+  });
+
+  it("an OPTION-supplied secret OVERRIDES a persisted one (app re-supplies a known secret)", async () => {
+    const store = makeStore();
+    await seed(store, {
+      tokenEndpointAuthMethod: "client_secret_basic",
+      clientSecret: "stale-persisted-secret",
+      clientId: "server-assigned-dynamic-client-id",
+    });
+    await restoreSession({
+      store,
+      issuer: ISSUER,
+      tokenEndpointAuthMethod: "client_secret_basic",
+      clientSecret: "fresh-option-secret",
+    });
+    expect(refreshMock.grantClientAuths[0]).toEqual({
+      method: "client_secret_basic",
+      secret: "fresh-option-secret",
+    });
+  });
+
+  it("FAIL-CLOSED: a confidential method with NO secret → undefined, NO grant, credential PRESERVED", async () => {
+    // A corrupt/partial record asserts client_secret_basic but carries no secret. We
+    // must NOT silently downgrade to `none` (which could mis-authenticate) — fail
+    // closed: no grant, the refresh token is preserved (this is not proof it is dead).
+    const store = makeStore();
+    await seed(store, {
+      tokenEndpointAuthMethod: "client_secret_basic",
+      clientId: "server-assigned-dynamic-client-id",
+      // clientSecret deliberately absent
+    });
+    const restored = await restoreSession({ store, issuer: ISSUER });
+    expect(restored).toBeUndefined();
+    // No grant was even attempted (we bailed before the token endpoint).
+    expect(refreshMock.grantClientAuths).toHaveLength(0);
+    expect(refreshMock.grantTokens).toHaveLength(0);
+    // The credential is PRESERVED — a missing secret is not proof the token is dead.
+    expect(store.map.get(ISSUER.href)?.refreshToken).toBe("rt-A");
+  });
+
+  it("FAIL-CLOSED: a confidential method with an EMPTY-STRING secret is also rejected", async () => {
+    const store = makeStore();
+    await seed(store, {
+      tokenEndpointAuthMethod: "client_secret_basic",
+      clientSecret: "",
+      clientId: "server-assigned-dynamic-client-id",
+    });
+    expect(await restoreSession({ store, issuer: ISSUER })).toBeUndefined();
+    expect(refreshMock.grantClientAuths).toHaveLength(0);
+    expect(store.map.get(ISSUER.href)?.refreshToken).toBe("rt-A");
+  });
+
+  it("FAIL-CLOSED: a PERSISTED unsupported method (client_secret_jwt) aborts, not downgrades to `none`", async () => {
+    // A corrupt/foreign store entry asserts a method we cannot honour. It must fail
+    // closed exactly like the fresh-registration path — never be treated as public
+    // `none` (which would skip the auth the record demanded) (roborev finding).
+    const store = makeStore();
+    await seed(store, {
+      // cast through unknown: the store could hold any string at runtime.
+      tokenEndpointAuthMethod: "client_secret_jwt" as unknown as "client_secret_basic",
+      clientSecret: "s3cr3t",
+      clientId: "server-assigned-dynamic-client-id",
+    });
+    const restored = await restoreSession({ store, issuer: ISSUER });
+    expect(restored).toBeUndefined();
+    expect(refreshMock.grantClientAuths).toHaveLength(0);
+    expect(refreshMock.dynamicRegistrations).toBe(0); // a clientId was present — no re-register
+    expect(store.map.get(ISSUER.href)?.refreshToken).toBe("rt-A"); // preserved
+  });
+
+  it("persists the RESOLVED client_id (option override), NOT a stale stored one (client-binding)", async () => {
+    // When options.clientId overrides a stale persisted id, the rotated refresh token
+    // is issued to the RESOLVED client — so that id, not the stale stored one, must be
+    // persisted, else a later restore redeems the new token as the WRONG client (roborev
+    // finding).
+    const store = makeStore();
+    await seed(store, { clientId: "stale-stored-id" });
+    await restoreSession({
+      store,
+      issuer: ISSUER,
+      clientId: "https://app.example/clientid.jsonld",
+    });
+    expect(refreshMock.grantClientIds).toEqual(["https://app.example/clientid.jsonld"]);
+    expect(store.map.get(ISSUER.href)?.clientId).toBe("https://app.example/clientid.jsonld");
+  });
+
+  it("ignores a persisted secret when the method is `none` (never sends it) and does NOT re-persist it", async () => {
+    // Defence-in-depth: a stray secret on a `none` record must not leak into the grant.
+    const store = makeStore();
+    await seed(store, {
+      tokenEndpointAuthMethod: "none",
+      clientSecret: "stray-secret",
+      clientId: "server-assigned-dynamic-client-id",
+    });
+    await restoreSession({ store, issuer: ISSUER });
+    expect(refreshMock.grantClientAuths[0]).toEqual({ method: "none" });
+    // The rotated re-persist drops the stray secret (a `none` record stays secret-free).
+    const persisted = store.map.get(ISSUER.href);
+    expect(persisted?.clientSecret).toBeUndefined();
+    expect(persisted?.tokenEndpointAuthMethod).toBeUndefined();
+  });
+
+  it("an OPTION clientSecret with NO confidential method resolves to `none` (the secret is NOT sent)", async () => {
+    // The documented gotcha: a secret alone does not make a client confidential. With
+    // no method (option/persisted) the resolved method defaults to `none`, so the grant
+    // uses `none` and the secret is ignored — never silently sent.
+    const store = makeStore();
+    await seed(store, { clientId: "server-assigned-dynamic-client-id" }); // no method persisted
+    await restoreSession({ store, issuer: ISSUER, clientSecret: "lonely-secret" });
+    expect(refreshMock.grantClientAuths[0]).toEqual({ method: "none" });
+    const persisted = store.map.get(ISSUER.href);
+    expect(persisted?.clientSecret).toBeUndefined();
   });
 });
 

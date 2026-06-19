@@ -20,8 +20,23 @@
 //
 // ─── Threat model (this module persists a credential — read before changing) ──
 // What we persist per issuer: the refresh token (string) + the DPoP CryptoKeyPair
-// + WebID + issuer (+ optional clientId / expiresAt). We DO NOT persist the
-// access token (it is short-lived and re-minted by the refresh grant on restore).
+// + WebID + issuer (+ optional clientId / expiresAt / a CONFIDENTIAL-CLIENT secret).
+// We DO NOT persist the access token (it is short-lived and re-minted by the refresh
+// grant on restore).
+//
+//   • Confidential-client secret (OPTIONAL — bespoke, ESS/PodSpaces path). A handful
+//     of Solid-OIDC servers (notably Inrupt ESS / PodSpaces) hand back a
+//     `client_secret` + `token_endpoint_auth_method: "client_secret_basic"` from
+//     DYNAMIC client registration. For such a session the refresh-token grant must
+//     present that secret (RFC 6749 §2.3 / OIDC Core §9) or it fails client
+//     authentication — so to restore a closed tab we must persist it. It is held in
+//     the SAME origin-scoped, app-scoped IndexedDB store as the refresh token, under
+//     the same fail-closed / clear-on-logout discipline, and is NEVER logged. Storing
+//     it is strictly NO WORSE than storing the refresh token it authorises (an
+//     on-origin XSS that can read one can read both); off-origin it is useless
+//     because the grant is ALSO DPoP-bound to the non-extractable key. A PUBLIC
+//     client (static Client Identifier Document / PKCE) persists NO secret — the
+//     field is simply absent, and the grant uses `none` auth as before.
 //
 //   • The DPoP private key is stored in IndexedDB as a `CryptoKey` with
 //     `extractable: false`. IndexedDB can structured-clone a non-extractable

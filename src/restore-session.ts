@@ -27,9 +27,21 @@
 //  • ROTATION: when the server rotates the refresh token (RFC 9700 §4.14.2), the
 //    NEW token is re-persisted so the next reload uses the current credential.
 //  • The ACCESS TOKEN is never persisted; the refresh token is never logged.
+//  • PUBLIC by DEFAULT, CONFIDENTIAL only when a secret is present: the grant uses
+//    `none` client auth (RFC 6749 §2.3 / OIDC Core §9) unless the session is a
+//    CONFIDENTIAL client (a persisted `client_secret` + `client_secret_basic`/
+//    `client_secret_post` method — the ESS/PodSpaces dynamic-registration path), in
+//    which case the secret is presented per the persisted method. The secret is
+//    NEVER logged and is cleared with the rest of the credential on logout. This is
+//    additive: a static Client Identifier Document / PKCE client persists no secret
+//    and behaves exactly as before (`none`).
 
 import * as oauth from "oauth4webapi";
-import type { PersistedSession, SessionStore } from "./session-persistence.js";
+import type {
+  PersistedSession,
+  SessionStore,
+  TokenEndpointAuthMethod,
+} from "./session-persistence.js";
 
 /** Refresh this much before the reported expiry to absorb clock skew. */
 const EXPIRY_SKEW_MS = 30_000;
@@ -118,6 +130,27 @@ export interface RestoreSessionOptions {
    */
   callbackUri?: string;
   /**
+   * OPTIONAL confidential-client secret to authenticate the refresh grant with (RFC
+   * 6749 §2.3.1). LEAVE UNSET for a PUBLIC client (the common case — static Client
+   * Identifier Document / PKCE; the grant uses `none`). Set it only for a
+   * CONFIDENTIAL client (the ESS/PodSpaces path), AND ONLY ALONGSIDE a confidential
+   * {@link tokenEndpointAuthMethod} (this option or the persisted one) — the secret is
+   * IGNORED unless a confidential method resolves (the resolved method defaults to
+   * `none`, which sends no secret). When set it OVERRIDES the persisted
+   * {@link PersistedSession.clientSecret} (an app re-supplying a known secret); when
+   * unset the helper falls back to the persisted secret. NEVER logged.
+   */
+  clientSecret?: string;
+  /**
+   * OPTIONAL token-endpoint client-authentication method (RFC 6749 §2.3 / OIDC Core
+   * §9). Defaults to the persisted {@link PersistedSession.tokenEndpointAuthMethod},
+   * else `"none"` (public client). Only consulted when a secret resolves (this
+   * option's {@link clientSecret} or the persisted one): `"client_secret_basic"` /
+   * `"client_secret_post"` choose how the secret is presented; `"none"` ignores any
+   * secret. An override here takes precedence over the persisted method.
+   */
+  tokenEndpointAuthMethod?: TokenEndpointAuthMethod;
+  /**
    * Enable oauth4webapi's `allowInsecureRequests` for `localhost` / `127.0.0.1`
    * issuers only (dev CSS over HTTP). Remote HTTPS issuers are unaffected, and
    * non-loopback HTTP issuers are never allowed. Default `false`.
@@ -177,63 +210,226 @@ async function discover(
   return oauth.processDiscoveryResponse(issuer, discoveryResponse);
 }
 
+/** Whether a method actually requires a secret (a confidential method). */
+function isConfidentialMethod(
+  method: TokenEndpointAuthMethod | undefined,
+): method is "client_secret_basic" | "client_secret_post" {
+  return method === "client_secret_basic" || method === "client_secret_post";
+}
+
 /**
- * Resolve the OAuth client a refresh grant must run as. A refresh token is
- * CLIENT-BOUND (RFC 6749 §6 / §10.4): it can only be redeemed by the same client
- * that obtained it. So we reuse the original client identity — `options.clientId`
- * (the app's static Client Identifier Document URL, if it used one) OR the
- * `clientId` the original login PERSISTED into the session record (which, for the
- * dynamic-registration path, is the server-assigned `client_id`). We perform a
- * FRESH dynamic registration ONLY when neither is available — a brand-new client
+ * Whether a token-endpoint auth method is one this package SUPPORTS — exactly
+ * `none` / `client_secret_basic` / `client_secret_post`. Any other defined value
+ * (e.g. `client_secret_jwt`, `private_key_jwt`, `tls_client_auth`) is unsupported,
+ * and an unsupported method must FAIL CLOSED rather than silently downgrade to `none`
+ * (roborev finding). Accepts an unknown string because the value can come from a
+ * persisted record / option / server registration response.
+ */
+function isSupportedMethod(method: string | undefined): method is TokenEndpointAuthMethod {
+  return method === "none" || method === "client_secret_basic" || method === "client_secret_post";
+}
+
+/**
+ * The refresh grant's resolved client, plus the CONFIDENTIAL-client credentials (if
+ * any) the grant must present and re-persist. For a PUBLIC client `authMethod` is
+ * `"none"` and `secret` is `undefined` — the common case.
+ */
+interface ResolvedClient {
+  client: oauth.Client;
+  /** The token-endpoint auth method this grant uses (RFC 6749 §2.3 / OIDC Core §9). */
+  authMethod: TokenEndpointAuthMethod;
+  /** The confidential-client secret, present iff {@link authMethod} is confidential. */
+  secret: string | undefined;
+  /**
+   * The resolved method (persisted/option/registered) was a DEFINED but UNSUPPORTED
+   * one (e.g. `client_secret_jwt` / `private_key_jwt` / `tls_client_auth`). The grant
+   * must FAIL CLOSED — {@link buildClientAuth} returns `undefined` so restore aborts
+   * rather than silently sending `none`.
+   */
+  unsupported: boolean;
+}
+
+/**
+ * Resolve the OAuth client a refresh grant must run as, AND how it authenticates. A
+ * refresh token is CLIENT-BOUND (RFC 6749 §6 / §10.4): it can only be redeemed by
+ * the same client that obtained it. So we reuse the original client identity —
+ * `options.clientId` (the app's static Client Identifier Document URL, if it used
+ * one) OR the `clientId` the original login PERSISTED into the session record (which,
+ * for the dynamic-registration path, is the server-assigned `client_id`). We perform
+ * a FRESH dynamic registration ONLY when neither is available — a brand-new client
  * has no claim to a previously-issued refresh token, so reusing the stored id is
  * what keeps a dynamic-login user restorable instead of failing `invalid_client`
- * (roborev finding). All paths are public browser clients (`none` token-endpoint
- * auth); the persisted refresh token's DPoP-binding (not the client secret) is what
- * authorises the grant.
+ * (roborev finding).
+ *
+ * CLIENT AUTH (RFC 6749 §2.3 / OIDC Core §9): a static Client Identifier Document /
+ * PKCE client is PUBLIC → `none` (no secret), as before. A CONFIDENTIAL client —
+ * persisted (or option-supplied) with a `client_secret` + a
+ * `client_secret_basic`/`client_secret_post` method (the rare ESS/PodSpaces dynamic
+ * path) — presents that secret. The method/secret are resolved with OPTION-OVER-
+ * PERSISTED precedence; a fresh dynamic registration adopts whatever the server
+ * returns. The DPoP-binding still authorises the grant regardless — the client
+ * secret is the SECOND factor some servers additionally require.
  */
 async function resolveClient(
   authorizationServer: oauth.AuthorizationServer,
   options: RestoreSessionOptions,
   stored: PersistedSession,
   http: ReturnType<typeof httpOptions>,
-): Promise<oauth.Client> {
+): Promise<ResolvedClient> {
   const clientId = options.clientId ?? stored.clientId;
+  // Option overrides persisted; default `none` (public client) when neither set. The
+  // value can come from a persisted record / option, so VALIDATE it (it is typed but a
+  // store could hold any string): an UNSUPPORTED method (client_secret_jwt /
+  // private_key_jwt / tls_client_auth) must fail closed, not silently downgrade to
+  // `none` — same fail-closed rule the fresh-registration path uses (roborev finding).
+  const requestedMethod: string | undefined =
+    options.tokenEndpointAuthMethod ?? stored.tokenEndpointAuthMethod;
+  const supported = requestedMethod === undefined || isSupportedMethod(requestedMethod);
+  const authMethod: TokenEndpointAuthMethod = supported
+    ? ((requestedMethod ?? "none") as TokenEndpointAuthMethod)
+    : "client_secret_basic"; // sentinel; unsupported→true makes buildClientAuth fail closed
+  const secret = options.clientSecret ?? stored.clientSecret;
+
   if (clientId !== undefined && clientId !== "") {
     return {
-      client_id: clientId,
-      token_endpoint_auth_method: "none",
-      ...(options.callbackUri ? { redirect_uris: [options.callbackUri] } : {}),
-      response_types: ["code"],
+      client: {
+        client_id: clientId,
+        token_endpoint_auth_method: authMethod,
+        ...(options.callbackUri ? { redirect_uris: [options.callbackUri] } : {}),
+        response_types: ["code"],
+      },
+      authMethod,
+      secret: supported && isConfidentialMethod(authMethod) ? secret : undefined,
+      unsupported: !supported,
     };
   }
   // No persisted/static client id — fall back to a fresh dynamic registration. This
   // only succeeds against servers whose refresh tokens are not strictly bound to the
   // original registration; it is the best available behaviour for the rare case of a
-  // dynamic login that never persisted its client id.
+  // dynamic login that never persisted its client id. Adopt whatever client-auth the
+  // server registers us with (it may be `client_secret_basic` — the ESS case).
   const registrationResponse = await oauth.dynamicClientRegistrationRequest(
     authorizationServer,
     options.callbackUri ? { redirect_uris: [options.callbackUri] } : {},
     http,
   );
-  return oauth.processDynamicClientRegistrationResponse(registrationResponse);
+  const registered = await oauth.processDynamicClientRegistrationResponse(registrationResponse);
+  // The registration metadata is loosely typed (any JSON value); coerce the method to
+  // a string-or-undefined before validating, so a non-string value is treated as
+  // "no usable method" (→ the omitted/default path), never crashes the type check.
+  const registeredMethod: string | undefined =
+    typeof registered.token_endpoint_auth_method === "string"
+      ? registered.token_endpoint_auth_method
+      : undefined;
+  const freshSecret =
+    typeof registered.client_secret === "string" && registered.client_secret !== ""
+      ? registered.client_secret
+      : undefined;
+  // Resolve the fresh registration's client-auth method, defaulting per OIDC/RFC 7591:
+  //  • method OMITTED → `client_secret_basic` if a secret was issued (RFC 7591 §2 /
+  //    OIDC Registration 1.0 default; treating it as `none` would skip required auth),
+  //    else `none` (a public client, as before);
+  //  • a supported method (none / client_secret_basic / client_secret_post) → adopt it;
+  //  • ANY OTHER defined method (client_secret_jwt / private_key_jwt / tls_client_auth)
+  //    → UNSUPPORTED: FAIL CLOSED — model it as a confidential method with NO usable
+  //    secret so {@link buildClientAuth} returns undefined and the restore aborts. We
+  //    must never silently send `none` (mis-auth) to a server that registered us with a
+  //    stronger method, whether or not a secret was also issued (roborev finding).
+  const effectiveMethod =
+    registeredMethod ?? (freshSecret !== undefined ? "client_secret_basic" : "none");
+  const freshSupported = isSupportedMethod(effectiveMethod);
+  const freshMethod: TokenEndpointAuthMethod = freshSupported
+    ? (effectiveMethod as TokenEndpointAuthMethod)
+    : "client_secret_basic"; // sentinel; unsupported→true fails closed in buildClientAuth
+  return {
+    client: registered,
+    authMethod: freshMethod,
+    secret: freshSupported && isConfidentialMethod(freshMethod) ? freshSecret : undefined,
+    unsupported: !freshSupported,
+  };
 }
 
 /**
- * The refresh-token grant (RFC 6749 §6), DPoP-bound with the supplied key/handle,
- * adopting the rotated refresh token when the server issues one. One retry on a
- * server-required DPoP nonce (the handle captures it from the error).
+ * A variant of oauth4webapi's {@link oauth.ClientSecretBasic} that does NOT
+ * URL-encode the client_id / secret before base64. PodSpaces (Inrupt ESS) rejects
+ * the spec-compliant `application/x-www-form-urlencoded` form (RFC 6749 §2.3.1 /
+ * Appendix B) and expects the raw values — this is a BESPOKE per-server workaround,
+ * scoped to ESS issuers only. The standard, spec-following encoder is used for every
+ * other server.
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc6749.html#section-2.3.1
+ */
+function noUrlEncodeClientSecretBasic(clientSecret: string): oauth.ClientAuth {
+  return (_as, client, _body, headers) => {
+    headers.set("authorization", `Basic ${btoa(`${client.client_id}:${clientSecret}`)}`);
+  };
+}
+
+/** The ESS host whose token endpoint rejects the spec form-url-encoded Basic creds. */
+const ESS_NO_URL_ENCODE_HOST = "login.inrupt.com";
+
+/**
+ * Whether an issuer is the Inrupt ESS host that needs the no-url-encode workaround,
+ * matched on the EXACT hostname (an unparseable issuer → false, so we never apply the
+ * bespoke path to an unknown issuer). This is stricter than the pod-mail provider's
+ * substring `includes` — an exact host match cannot be tricked by an unrelated issuer
+ * whose URL merely CONTAINS the substring (e.g. a path/subdomain), which would
+ * otherwise send a non-standard Basic header to the wrong server (roborev finding).
+ */
+function isEssNoUrlEncodeIssuer(issuer: string): boolean {
+  try {
+    return new URL(issuer).hostname === ESS_NO_URL_ENCODE_HOST;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Pick the `client_secret_basic` constructor for an issuer: the BESPOKE
+ * non-URL-encoding variant for Inrupt ESS (`login.inrupt.com`) — which rejects the
+ * spec encoding — and the standard, RFC-6749-§2.3.1-compliant
+ * {@link oauth.ClientSecretBasic} for every other server. Mirrors the pod-mail
+ * provider's `clientSecretBasicFor` (hardened to an exact-hostname match).
+ */
+function clientSecretBasicFor(issuer: string): (secret: string) => oauth.ClientAuth {
+  return isEssNoUrlEncodeIssuer(issuer) ? noUrlEncodeClientSecretBasic : oauth.ClientSecretBasic;
+}
+
+/**
+ * Build the oauth4webapi {@link oauth.ClientAuth} for a resolved client. PUBLIC
+ * clients → `none` (RFC 6749 §2.3, no secret). CONFIDENTIAL clients present their
+ * secret per the resolved method (RFC 6749 §2.3.1 / OIDC Core §9):
+ * `client_secret_basic` via the Basic header (with the ESS no-URL-encode workaround),
+ * `client_secret_post` via the form body. Returns `undefined` — a FAIL-CLOSED signal
+ * — when (a) the resolved method is a defined but UNSUPPORTED one, or (b) a confidential
+ * method was resolved but NO secret is available: we must NOT silently downgrade to
+ * `none` (that would mis-authenticate, and on some servers succeed-as-public when the
+ * user intended a confidential client), so the caller aborts the restore instead.
+ */
+function buildClientAuth(issuer: string, resolved: ResolvedClient): oauth.ClientAuth | undefined {
+  if (resolved.unsupported) return undefined; // fail-closed: unsupported auth method
+  if (!isConfidentialMethod(resolved.authMethod)) return oauth.None();
+  const secret = resolved.secret;
+  if (secret === undefined || secret === "") return undefined; // fail-closed: no secret
+  return resolved.authMethod === "client_secret_post"
+    ? oauth.ClientSecretPost(secret)
+    : clientSecretBasicFor(issuer)(secret);
+}
+
+/**
+ * The refresh-token grant (RFC 6749 §6), DPoP-bound with the supplied key/handle and
+ * authenticated with the supplied client-auth, adopting the rotated refresh token
+ * when the server issues one. One retry on a server-required DPoP nonce (the handle
+ * captures it from the error).
  */
 async function refreshGrant(
   authorizationServer: oauth.AuthorizationServer,
   clientRegistration: oauth.Client,
+  clientAuth: oauth.ClientAuth,
   dpopHandle: oauth.DPoPHandle,
   refreshToken: string,
   http: ReturnType<typeof httpOptions>,
 ): Promise<oauth.TokenEndpointResponse> {
-  // Public browser client → `none` client auth (no secret); the static-client and
-  // dynamic-registration paths both register as `none` here.
-  const clientAuth = oauth.None();
-
   const grant = () =>
     oauth.refreshTokenGrantRequest(
       authorizationServer,
@@ -263,9 +459,14 @@ async function refreshGrant(
 /**
  * Re-persist the ROTATED refresh-token session so the NEXT reload restores from the
  * CURRENT credential, not a spent one (servers rotate refresh tokens — RFC 9700
- * §4.14.2). The persisted record carries forward the original `clientId` (the refresh
- * token stays client-bound) and the advisory `expiresAt`; the access token is NEVER
- * persisted.
+ * §4.14.2). The persisted record carries forward the RESOLVED `clientId` — the
+ * persisted/static one, or (for a fresh dynamic registration that had none) the
+ * SERVER-ASSIGNED id — so the refresh token stays client-bound (RFC 6749 §6 / §10.4)
+ * and the next reload reuses the same client instead of re-registering; plus the
+ * advisory `expiresAt`, and — for a CONFIDENTIAL client — the resolved
+ * `tokenEndpointAuthMethod` + `clientSecret` (so the NEXT reload can authenticate the
+ * grant the same way, incl. a secret first seen on this load's fresh dynamic
+ * registration). The access token is NEVER persisted.
  *
  * BEST-EFFORT and SELF-CONTAINED: it swallows its own store-write error so a failed
  * re-persist can never (a) fail an otherwise-good restore, nor (b) escape to
@@ -278,14 +479,42 @@ async function persistRotatedSession(
   issuer: URL,
   stored: PersistedSession,
   restored: RestoredSession,
+  resolved: ResolvedClient,
 ): Promise<void> {
+  // Carry the CONFIDENTIAL credentials forward ONLY when the grant actually used a
+  // confidential method WITH a secret — never persist `none`/an empty secret, so a
+  // public client's record stays secret-free. Capture the narrowed secret into a
+  // local (a non-empty string here) so the spread satisfies exactOptionalPropertyTypes.
+  const secret = resolved.secret;
+  const confidential =
+    isConfidentialMethod(resolved.authMethod) && secret !== undefined && secret !== "";
+  // PRESERVE the client_id the grant ACTUALLY ran as so the next reload reuses the SAME
+  // client (a refresh token is client-bound — RFC 6749 §6 / §10.4). Prefer the RESOLVED
+  // client_id over the stored one: when `options.clientId` overrode a stale persisted id
+  // (or a fresh dynamic registration ran), the rotated refresh token was issued to the
+  // RESOLVED client, so persisting the stale stored id would let a later restore redeem
+  // it as the WRONG client (roborev finding). Fall back to the (normalised, non-empty)
+  // stored id only if the resolved client somehow carries none.
+  const resolvedClientId =
+    typeof resolved.client.client_id === "string" && resolved.client.client_id !== ""
+      ? resolved.client.client_id
+      : undefined;
+  const persistedClientId =
+    stored.clientId !== undefined && stored.clientId !== "" ? stored.clientId : undefined;
+  const clientId = resolvedClientId ?? persistedClientId;
   try {
     await store.put({
       issuer: issuer.href,
       webId: restored.webId,
       refreshToken: restored.refreshToken,
       dpopKey: stored.dpopKey,
-      ...(stored.clientId !== undefined ? { clientId: stored.clientId } : {}),
+      ...(clientId !== undefined ? { clientId } : {}),
+      ...(confidential
+        ? {
+            tokenEndpointAuthMethod: resolved.authMethod,
+            clientSecret: secret,
+          }
+        : {}),
       ...(restored.expiresAt !== undefined ? { expiresAt: restored.expiresAt } : {}),
     });
   } catch {
@@ -326,7 +555,17 @@ export async function restoreSession(
   try {
     const http = httpOptions(issuer, options);
     const authorizationServer = await discover(issuer, http);
-    const clientRegistration = await resolveClient(authorizationServer, options, stored, http);
+    const resolved = await resolveClient(authorizationServer, options, stored, http);
+    const clientRegistration = resolved.client;
+
+    // Build the client authentication (RFC 6749 §2.3 / OIDC Core §9): `none` for a
+    // PUBLIC client, the persisted/resolved secret for a CONFIDENTIAL one. A
+    // confidential method with NO secret yields `undefined` — FAIL CLOSED rather than
+    // silently downgrade to `none` (which could mis-authenticate the client). Treated
+    // like a transient failure: the credential is PRESERVED (it is not proof the
+    // refresh token itself is dead), and this load falls back to login.
+    const clientAuth = buildClientAuth(authorizationServer.issuer, resolved);
+    if (clientAuth === undefined) return undefined;
 
     // Reattach the PERSISTED, non-extractable DPoP key — the refresh-grant proof
     // must be signed by the key the token is bound to (RFC 9449 §4.3).
@@ -335,6 +574,7 @@ export async function restoreSession(
     const tokenResult = await refreshGrant(
       authorizationServer,
       clientRegistration,
+      clientAuth,
       dpopHandle,
       stored.refreshToken,
       http,
@@ -357,8 +597,10 @@ export async function restoreSession(
       issuer: issuer.href,
     };
 
-    // Re-persist the rotated credential (best-effort; self-contained — see the helper).
-    await persistRotatedSession(store, issuer, stored, restored);
+    // Re-persist the rotated credential (best-effort; self-contained — see the helper),
+    // carrying forward the resolved confidential-client auth (method + secret) so the
+    // next reload authenticates the grant the same way.
+    await persistRotatedSession(store, issuer, stored, restored, resolved);
 
     return restored;
   } catch (e) {
