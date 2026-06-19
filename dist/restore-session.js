@@ -151,6 +151,34 @@ async function refreshGrant(authorizationServer, clientRegistration, dpopHandle,
     }
 }
 /**
+ * Re-persist the ROTATED refresh-token session so the NEXT reload restores from the
+ * CURRENT credential, not a spent one (servers rotate refresh tokens — RFC 9700
+ * §4.14.2). The persisted record carries forward the original `clientId` (the refresh
+ * token stays client-bound) and the advisory `expiresAt`; the access token is NEVER
+ * persisted.
+ *
+ * BEST-EFFORT and SELF-CONTAINED: it swallows its own store-write error so a failed
+ * re-persist can never (a) fail an otherwise-good restore, nor (b) escape to
+ * {@link restoreSession}'s outer catch, where a write fault would be misclassified
+ * against `invalid_grant`. A failed re-persist leaves THIS load's in-memory session
+ * valid; the next reload may re-prompt. Never logged.
+ */
+async function persistRotatedSession(store, issuer, stored, restored) {
+    try {
+        await store.put({
+            issuer: issuer.href,
+            webId: restored.webId,
+            refreshToken: restored.refreshToken,
+            dpopKey: stored.dpopKey,
+            ...(stored.clientId !== undefined ? { clientId: stored.clientId } : {}),
+            ...(restored.expiresAt !== undefined ? { expiresAt: restored.expiresAt } : {}),
+        });
+    }
+    catch {
+        // Durable re-persistence failed — see the doc comment. Non-fatal, never logged.
+    }
+}
+/**
  * RESTORE a returning user's session for a KNOWN issuer from the durable store via
  * a `refresh_token` grant — a token-endpoint FETCH, never a window/iframe.
  *
@@ -200,23 +228,8 @@ export async function restoreSession(options) {
             expiresAt: expiresAtFrom(tokenResult),
             issuer: issuer.href,
         };
-        // Persist the ROTATED token (servers rotate refresh tokens, RFC 9700 §4.14.2)
-        // so the NEXT reload restores from the current credential, not a spent one.
-        // Best-effort: a store write error must not fail an otherwise-good restore.
-        try {
-            await store.put({
-                issuer: issuer.href,
-                webId,
-                refreshToken,
-                dpopKey: stored.dpopKey,
-                ...(stored.clientId !== undefined ? { clientId: stored.clientId } : {}),
-                ...(restored.expiresAt !== undefined ? { expiresAt: restored.expiresAt } : {}),
-            });
-        }
-        catch {
-            // Durable re-persistence failed — the in-memory restored session is still
-            // valid for THIS load; the next reload may re-prompt. Never logged.
-        }
+        // Re-persist the rotated credential (best-effort; self-contained — see the helper).
+        await persistRotatedSession(store, issuer, stored, restored);
         return restored;
     }
     catch (e) {
