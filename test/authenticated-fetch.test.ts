@@ -315,6 +315,151 @@ describe("toAuthenticatedFetch — fail-closed refresh paths", () => {
   });
 });
 
+describe("toAuthenticatedFetch — concurrent-401 refresh coalescing (single-flight + freshest-wins)", () => {
+  it("coalesces N simultaneous 401s into exactly ONE refresh and retries all with the fresh token", async () => {
+    // Three requests fire concurrently, ALL get a bare 401, then ALL succeed on retry. The
+    // single shared in-flight refresh must run exactly ONCE and every retry must use the fresh
+    // credential — no per-request refresh, no stale-token reuse.
+    oauthMock.behaviours.push(
+      resp401(),
+      resp401(),
+      resp401(), // the three initial sends all 401
+      resp200("retry-a"),
+      resp200("retry-b"),
+      resp200("retry-c"), // the three retries succeed
+    );
+    const freshHandle = fakeHandle("handle-2");
+    let refreshCalls = 0;
+    const refresh = vi.fn(async () => {
+      refreshCalls += 1;
+      // Yield so all three 401'd requests are awaiting before this resolves — proving the
+      // coalescing holds them on ONE promise rather than each firing its own refresh.
+      await Promise.resolve();
+      return { accessToken: "access-2", dpopHandle: freshHandle };
+    });
+
+    const authed = toAuthenticatedFetch(makeSession(), { refresh });
+    const [a, b, c] = await Promise.all([
+      authed("https://pod.example/a"),
+      authed("https://pod.example/b"),
+      authed("https://pod.example/c"),
+    ]);
+
+    // Exactly one refresh despite three concurrent 401s.
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refreshCalls).toBe(1);
+
+    // All three retries used the FRESH token + handle (never the stale "access-1").
+    const retries = oauthMock.calls.slice(3);
+    expect(retries).toHaveLength(3);
+    for (const call of retries) {
+      expect(call.accessToken).toBe("access-2");
+      expect(call.options.DPoP).toBe(freshHandle);
+    }
+
+    // All three requests resolved to their fresh-token retry response.
+    expect(await a.text()).toBe("retry-a");
+    expect(await b.text()).toBe("retry-b");
+    expect(await c.text()).toBe("retry-c");
+    // 3 initial sends + 3 retries, no extra refresh-driven sends.
+    expect(oauthMock.calls).toHaveLength(6);
+  });
+
+  it("freshest credential wins — a concurrent 401'd request that joins after the refresh lands retries with the fresh token (cred only moves forward)", async () => {
+    // R1 401s and starts the refresh; while it is in flight R2 also 401s with the SAME stale
+    // credential and JOINS the one refresh. Both must retry with the fresh token; the stale
+    // "access-1" must never be reused after the refresh resolved.
+    oauthMock.behaviours.push(resp401(), resp401(), resp200("r1"), resp200("r2"));
+    const freshHandle = fakeHandle("h2");
+    const refresh = vi.fn(async () => {
+      await Promise.resolve();
+      return { accessToken: "access-2", dpopHandle: freshHandle };
+    });
+
+    const authed = toAuthenticatedFetch(makeSession(), { refresh });
+    const [r1, r2] = await Promise.all([
+      authed("https://pod.example/1"),
+      authed("https://pod.example/2"),
+    ]);
+
+    expect(refresh).toHaveBeenCalledTimes(1); // single-flight: one refresh for both
+    // Neither retry used the stale token; both moved forward to access-2.
+    const retries = oauthMock.calls.slice(2);
+    expect(retries.map((c) => c.accessToken)).toEqual(["access-2", "access-2"]);
+    expect(await r1.text()).toBe("r1");
+    expect(await r2.text()).toBe("r2");
+  });
+
+  it("a refresh genuinely starts again only AFTER the first one settled (later expiry → new refresh)", async () => {
+    // Request 1: 401 → refresh#1 → 200. Then, later, request 2: 401 again (token expired
+    // again) → refresh#2 → 200. The in-flight slot must clear after #1 so #2 can refresh.
+    oauthMock.behaviours.push(
+      resp401(),
+      resp200("first-ok"), // req1: 401 then refreshed-ok
+      resp401(),
+      resp200("second-ok"), // req2: 401 then refreshed-ok again
+    );
+    let n = 1;
+    const refresh = vi.fn(async () => ({
+      accessToken: `access-${++n}`,
+      dpopHandle: fakeHandle(`h${n}`),
+    }));
+
+    const authed = toAuthenticatedFetch(makeSession(), { refresh });
+    expect(await (await authed("https://pod.example/1")).text()).toBe("first-ok");
+    expect(await (await authed("https://pod.example/2")).text()).toBe("second-ok");
+
+    expect(refresh).toHaveBeenCalledTimes(2); // two SEQUENTIAL refreshes, not coalesced
+    expect(callAt(1).accessToken).toBe("access-2"); // req1 retry token
+    expect(callAt(3).accessToken).toBe("access-3"); // req2 retry token (fresher still)
+  });
+});
+
+describe("toAuthenticatedFetch — DPoP-nonce retry bounded to ONE per invocation (not per send-attempt)", () => {
+  it("does NOT allow a second nonce retry after a token refresh (one nonce retry per call)", async () => {
+    // Send 1 → nonce challenge → nonce retry (send 2) → 401 → refresh → retry (send 3) →
+    // nonce challenge AGAIN. With the budget bounded per INVOCATION, send 3's nonce error is
+    // terminal (no send 4): the per-call nonce budget was already spent before the refresh.
+    const nonce1 = challenge(400);
+    const nonce2 = challenge(400);
+    oauthMock.nonceErrors.add(nonce1);
+    oauthMock.nonceErrors.add(nonce2);
+    oauthMock.behaviours.push(
+      nonce1, // send 1: nonce challenge
+      resp401(), // send 2 (nonce retry): 401 → triggers refresh
+      nonce2, // send 3 (post-refresh retry): nonce challenge again
+    );
+    const refresh = vi.fn(async () => ({ accessToken: "access-2", dpopHandle: fakeHandle("h2") }));
+    const authed = toAuthenticatedFetch(makeSession(), { refresh });
+
+    // The post-refresh nonce error is not a token-expiry, so it RETHROWS (not masked as 401)
+    // — and crucially there is NO fourth send (the nonce budget is one per the whole call).
+    await expect(authed("https://pod.example/x")).rejects.toBe(nonce2);
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(oauthMock.calls).toHaveLength(3); // send1 + nonce-retry + post-refresh send, no 4th
+  });
+
+  it("still allows the single nonce retry when it happens AFTER the refresh (budget unspent before)", async () => {
+    // Send 1 → 401 → refresh → retry (send 2) → nonce challenge → nonce retry (send 3) → 200.
+    // The nonce budget was untouched before the refresh, so the one nonce retry is available
+    // on the post-refresh send.
+    const nonceErr = challenge(400);
+    oauthMock.nonceErrors.add(nonceErr);
+    oauthMock.behaviours.push(
+      resp401(), // send 1: 401 → refresh
+      nonceErr, // send 2 (post-refresh): nonce challenge
+      resp200("after-post-refresh-nonce"), // send 3: nonce retry succeeds
+    );
+    const refresh = vi.fn(async () => ({ accessToken: "access-2", dpopHandle: fakeHandle("h2") }));
+    const authed = toAuthenticatedFetch(makeSession(), { refresh });
+
+    const res = await authed("https://pod.example/x");
+    expect(await res.text()).toBe("after-post-refresh-nonce");
+    expect(oauthMock.calls).toHaveLength(3);
+    expect(callAt(2).accessToken).toBe("access-2"); // the nonce retry used the fresh token
+  });
+});
+
 describe("toAuthenticatedFetch — options wiring", () => {
   it("wires the optional fetch override through oauth4webapi.customFetch", async () => {
     const appFetch = vi.fn(async () => resp200());

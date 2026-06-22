@@ -26,8 +26,14 @@
 //  • STALE auth headers on the incoming request are STRIPPED before each send, so a
 //    caller cannot accidentally (or maliciously) pin a different `Authorization`/`DPoP`
 //    header onto a request that this fetch is meant to authenticate.
-//  • BOUNDED retries — at most one DPoP-nonce retry AND at most one token-refresh retry;
-//    a second 401 after a fresh token does NOT loop (it surfaces the failure).
+//  • BOUNDED retries — at most one DPoP-nonce retry per returned-fetch invocation AND at
+//    most one token-refresh retry; a second 401 after a fresh token does NOT loop (it
+//    surfaces the failure).
+//  • CONCURRENCY-SAFE refresh — N requests that 401 at the same time cause at MOST ONE
+//    refresh (a single shared in-flight promise), and the captured credential only ever
+//    moves FORWARD: a refresh result is committed only if `cred` has not already advanced
+//    past the credential that 401'd (compare-and-set), so a slower refresh can never clobber
+//    a newer token with an older one and force stale-token reuse.
 //  • The access/refresh tokens are NEVER logged.
 import * as oauth from "oauth4webapi";
 const isLoopback = (host) => host === "localhost" || host === "127.0.0.1" || host === "[::1]";
@@ -52,13 +58,21 @@ function isTokenExpiry(err) {
  * Two DISTINCT bounded retries, in order:
  *  1. DPoP-NONCE retry (RFC 9449 §8): the server may answer the first DPoP request with a
  *     `use_dpop_nonce` challenge; the handle captures the nonce, so we retry ONCE with it
- *     primed. This does NOT consume the token-refresh retry.
+ *     primed. The nonce retry is bounded to ONCE PER returned-fetch invocation — even across
+ *     the post-refresh re-send — so the contract is exactly one nonce retry per call, not one
+ *     per send-attempt. This does NOT consume the token-refresh retry.
  *  2. TOKEN-REFRESH retry: the captured access token is short-lived. On a 401 (an
  *     `invalid_token` challenge OR a bare-401 response) — when a {@link
  *     ToAuthenticatedFetchOptions.refresh} is supplied — we run it ONCE to silently re-mint
  *     a fresh credential, adopt it (so subsequent requests use the fresh token too), and
  *     retry the request ONCE. If `refresh` is absent or itself fails → the 401 propagates
  *     (no loop).
+ *
+ * CONCURRENCY: many requests on the same returned fetch can 401 simultaneously. They share a
+ * SINGLE in-flight refresh (the first 401'd request starts it; the rest await the same
+ * promise), so N concurrent 401s trigger at most ONE refresh. The captured credential is only
+ * ever advanced FORWARD via compare-and-set, so a refresh that resolves late cannot overwrite
+ * a credential a newer refresh already installed (no stale-token reuse).
  *
  * The returned function matches the Fetch API surface (`fetch(input, init)`), adapting it to
  * `protectedResourceRequest`'s `(accessToken, method, url, headers, body, opts)` shape.
@@ -67,9 +81,61 @@ export function toAuthenticatedFetch(session, options = {}) {
     const { refresh, fetch: appFetch, allowInsecureLoopback } = options;
     // The CAPTURED credential — mutable so a successful silent refresh updates it in place,
     // and every later request on this fetch uses the fresh token (not the expired original).
+    // It is only ever advanced FORWARD (compare-and-set in `refreshCredential`), so a slow
+    // refresh can never clobber a newer credential a concurrent refresh already installed.
     let cred = {
         accessToken: session.accessToken,
         dpopHandle: session.dpopHandle,
+    };
+    // The SINGLE in-flight refresh shared by all requests that 401 at the same time. The first
+    // 401'd request that finds none in flight starts it; every other concurrent 401 awaits the
+    // SAME promise — so N concurrent 401s cause at most ONE refresh. Cleared (back to null) when
+    // the refresh settles, so a LATER (genuine, post-expiry) 401 can start a fresh one.
+    let inFlightRefresh = null;
+    // Run the injected silent refresh, coalescing concurrent callers onto one shared promise and
+    // committing the result via compare-and-set so `cred` only moves forward. `usedCred` is the
+    // credential the failed request actually sent with; if `cred` has ALREADY advanced past it
+    // (another request's refresh landed first) we skip the refresh entirely and reuse the newer
+    // `cred`. Returns the credential to retry with, or null when refresh failed.
+    const refreshCredential = (usedCred, doRefresh) => {
+        // Another concurrent refresh already advanced the credential past the one that 401'd —
+        // no need to refresh again; retry with the credential that's already fresh.
+        if (cred !== usedCred)
+            return Promise.resolve(cred);
+        // Join the in-flight refresh if one is already running for this stale credential.
+        if (inFlightRefresh)
+            return inFlightRefresh;
+        // Start the single shared refresh. Commit (compare-and-set) only while still settling so a
+        // late-resolving refresh cannot overwrite a credential a newer refresh already installed.
+        const run = (async () => {
+            let fresh;
+            try {
+                fresh = await doRefresh();
+            }
+            catch {
+                // Refresh itself threw — fail-closed, no loop.
+                return null;
+            }
+            if (!fresh)
+                return null;
+            const next = {
+                accessToken: fresh.accessToken,
+                dpopHandle: fresh.dpopHandle,
+            };
+            // Compare-and-set: only adopt if nothing advanced `cred` while we were refreshing.
+            if (cred === usedCred)
+                cred = next;
+            // Return the live `cred` (it may already be newer if a concurrent refresh won the race)
+            // so every joiner retries with the freshest credential, never a stale one.
+            return cred;
+        })();
+        inFlightRefresh = run;
+        // Clear the in-flight slot once settled so a future (later-expiry) 401 starts a new one.
+        void run.finally(() => {
+            if (inFlightRefresh === run)
+                inFlightRefresh = null;
+        });
+        return run;
     };
     return async (input, init) => {
         // Normalise the Fetch API call through a SINGLE Request instance so the body bytes and
@@ -104,56 +170,67 @@ export function toAuthenticatedFetch(session, options = {}) {
         if (allowInsecureLoopback && isLoopback(url.hostname)) {
             http[oauth.allowInsecureRequests] = true;
         }
-        const send = () => oauth.protectedResourceRequest(cred.accessToken, method, url, 
+        // The credential a send used — captured so the post-401 path can compare-and-set against
+        // it (and so a single send reads ONE consistent {token, handle} pair even if `cred`
+        // advances mid-flight from a concurrent refresh).
+        const send = (sendCred) => oauth.protectedResourceRequest(sendCred.accessToken, method, url, 
         // A fresh Headers per send so a retry never inherits a header the previous send
         // mutated; protectedResourceRequest adds Authorization + DPoP onto this copy.
-        new Headers(headers), body, { ...http, DPoP: cred.dpopHandle });
-        // First attempt, with the DPoP-nonce retry (RFC 9449 §8) folded in. Resolves to a
+        new Headers(headers), body, { ...http, DPoP: sendCred.dpopHandle });
+        // The DPoP-nonce retry is bounded to ONCE PER returned-fetch INVOCATION (not once per
+        // send-attempt). `attempt()` is reused after a token refresh, so this flag carries the
+        // single-nonce-retry budget ACROSS that re-send — matching the documented "one nonce
+        // retry per call" contract instead of allowing one before AND one after the refresh.
+        let nonceRetryUsed = false;
+        // One send of the request, returning the credential it actually used alongside the
+        // Response, with the (invocation-bounded) DPoP-nonce retry folded in. Resolves to a
         // Response (incl. a bare 401 a server returns without a parseable challenge) or throws.
         const attempt = async () => {
+            // Snapshot the live credential ONCE per attempt so the retry's compare-and-set is
+            // against the exact credential this attempt sent with.
+            const usedCred = cred;
             try {
-                return await send();
+                return { res: await send(usedCred), usedCred };
             }
             catch (err) {
-                // One DPoP-nonce retry once the handle has captured the server's nonce.
-                if (oauth.isDPoPNonceError(err))
-                    return await send();
+                // One DPoP-nonce retry — but only if the per-invocation budget is unspent.
+                if (oauth.isDPoPNonceError(err) && !nonceRetryUsed) {
+                    nonceRetryUsed = true;
+                    return { res: await send(usedCred), usedCred };
+                }
                 throw err;
             }
         };
         // Run the request, then — ONCE — refresh-on-401 + retry. We catch both shapes of a 401:
         // a thrown WWWAuthenticateChallengeError (invalid_token) and a returned bare-401 Response.
         try {
-            const res = await attempt();
-            if (res.status === 401 && refresh)
-                return (await refreshAndRetry(attempt, refresh)) ?? res;
+            const { res, usedCred } = await attempt();
+            if (res.status === 401 && refresh) {
+                return (await refreshAndRetry(usedCred, refresh)) ?? res;
+            }
             return res;
         }
         catch (err) {
             if (isTokenExpiry(err) && !oauth.isDPoPNonceError(err) && refresh) {
-                const retried = await refreshAndRetry(attempt, refresh);
+                // The thrown-401 path: the failed send used the live `cred` at throw time.
+                const retried = await refreshAndRetry(cred, refresh);
                 if (retried)
                     return retried;
             }
             throw err;
         }
-        // Run the injected silent refresh ONCE; on success adopt the fresh credential and retry
-        // the request once. Returns the retried Response, or `null` when refresh failed / the
-        // retry still 401s (caller then propagates the original 401 — no loop).
-        async function refreshAndRetry(retry, doRefresh) {
-            let fresh;
-            try {
-                fresh = await doRefresh();
-            }
-            catch {
-                // Refresh itself threw — fail-closed, no loop.
-                return null;
-            }
+        // Refresh (coalesced + compare-and-set) the credential the failed request used, then retry
+        // the request ONCE with the resulting (always forward-only) credential. Returns the retried
+        // Response, or `null` when refresh failed / the retry still 401s (caller then propagates the
+        // original 401 — no loop).
+        async function refreshAndRetry(usedCred, doRefresh) {
+            const fresh = await refreshCredential(usedCred, doRefresh);
             if (!fresh)
                 return null;
-            cred = { accessToken: fresh.accessToken, dpopHandle: fresh.dpopHandle };
             try {
-                const res = await retry();
+                // `attempt()` re-reads the (now-advanced) live `cred`, so the retry uses the fresh
+                // credential; the per-invocation nonce budget is shared, so no extra nonce retry here.
+                const { res } = await attempt();
                 // A second 401 after a fresh token → do NOT loop; let the caller see the failure.
                 return res.status === 401 ? null : res;
             }

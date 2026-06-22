@@ -50,13 +50,21 @@ export interface ToAuthenticatedFetchOptions {
  * Two DISTINCT bounded retries, in order:
  *  1. DPoP-NONCE retry (RFC 9449 §8): the server may answer the first DPoP request with a
  *     `use_dpop_nonce` challenge; the handle captures the nonce, so we retry ONCE with it
- *     primed. This does NOT consume the token-refresh retry.
+ *     primed. The nonce retry is bounded to ONCE PER returned-fetch invocation — even across
+ *     the post-refresh re-send — so the contract is exactly one nonce retry per call, not one
+ *     per send-attempt. This does NOT consume the token-refresh retry.
  *  2. TOKEN-REFRESH retry: the captured access token is short-lived. On a 401 (an
  *     `invalid_token` challenge OR a bare-401 response) — when a {@link
  *     ToAuthenticatedFetchOptions.refresh} is supplied — we run it ONCE to silently re-mint
  *     a fresh credential, adopt it (so subsequent requests use the fresh token too), and
  *     retry the request ONCE. If `refresh` is absent or itself fails → the 401 propagates
  *     (no loop).
+ *
+ * CONCURRENCY: many requests on the same returned fetch can 401 simultaneously. They share a
+ * SINGLE in-flight refresh (the first 401'd request starts it; the rest await the same
+ * promise), so N concurrent 401s trigger at most ONE refresh. The captured credential is only
+ * ever advanced FORWARD via compare-and-set, so a refresh that resolves late cannot overwrite
+ * a credential a newer refresh already installed (no stale-token reuse).
  *
  * The returned function matches the Fetch API surface (`fetch(input, init)`), adapting it to
  * `protectedResourceRequest`'s `(accessToken, method, url, headers, body, opts)` shape.
