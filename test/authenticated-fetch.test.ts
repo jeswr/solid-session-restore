@@ -48,6 +48,15 @@ const oauthMock = vi.hoisted(() => {
     behaviours: [] as Array<Response | Error>,
     // Errors for which isDPoPNonceError returns true (a referential set).
     nonceErrors: new Set<unknown>(),
+    // OPTIONAL responder: when set, it (not the FIFO `behaviours` queue) decides each call's
+    // outcome by INSPECTING the (accessToken, url) — so a concurrency test stays deterministic
+    // regardless of microtask interleaving (no reliance on strict call ORDER). It returns (or
+    // resolves to) a Response to resolve with, or an Error to throw; an async responder can PARK
+    // a send (e.g. on a gate) to deterministically order failure-handling. When null, the FIFO
+    // queue is used.
+    responder: null as
+      | null
+      | ((accessToken: string, url: URL) => Response | Error | Promise<Response | Error>),
   };
 });
 
@@ -65,6 +74,12 @@ vi.mock("oauth4webapi", () => ({
       options: Record<PropertyKey, unknown>,
     ): Promise<Response> => {
       oauthMock.calls.push({ accessToken, method, url, headers, body, options });
+      // An order-independent responder takes precedence over the FIFO queue when present.
+      if (oauthMock.responder) {
+        const outcome = await oauthMock.responder(accessToken, url);
+        if (outcome instanceof Error) throw outcome;
+        return outcome;
+      }
       const behaviour = oauthMock.behaviours.shift();
       if (behaviour instanceof Error) throw behaviour;
       if (behaviour instanceof Response) return behaviour;
@@ -111,6 +126,7 @@ beforeEach(() => {
   oauthMock.calls.length = 0;
   oauthMock.behaviours.length = 0;
   oauthMock.nonceErrors.clear();
+  oauthMock.responder = null;
 });
 
 /** The i-th protectedResourceRequest call, asserting it happened (satisfies noUncheckedIndexedAccess). */
@@ -388,6 +404,87 @@ describe("toAuthenticatedFetch — concurrent-401 refresh coalescing (single-fli
     expect(retries.map((c) => c.accessToken)).toEqual(["access-2", "access-2"]);
     expect(await r1.text()).toBe("r1");
     expect(await r2.text()).toBe("r2");
+  });
+
+  it("THROWN invalid_token whose cred a peer ALREADY advanced → NO redundant refresh, retries with the fresh token (not the stale one)", async () => {
+    // The thrown-401 path must use the SAME snapshot discipline as the returned-401 path: it
+    // must compare-and-set against the credential the FAILED SEND used (captured per-attempt as
+    // `lastSendCred`), NOT the live `cred` — which a peer's refresh may have ALREADY advanced
+    // between R2's send and R2's failure-handling. Otherwise a request that THREW with an OLD
+    // token, when handled, would compare the stale failure against a fresh `cred`, mis-detect it,
+    // and fire a SECOND redundant refresh. This test is engineered so the bug DISTINGUISHES from
+    // the fix: R1's refresh FULLY LANDS (cred → access-2) BEFORE R2's thrown-401 is handled.
+    //
+    // Deterministic sequence via a gated, (token,url)-keyed responder (no FIFO-order reliance):
+    //   1. R2 SENDS with the stale access-1 → the responder records the send but PARKS the throw
+    //      on `r2ThrowGate` (so R2's failure is delayed until we choose).
+    //   2. R1 SENDS with the stale access-1 → returned bare-401 → R1 starts + COMPLETES the one
+    //      refresh (cred → access-2), then R1 RETRIES with access-2 → 200.
+    //   3. ONLY THEN do we release `r2ThrowGate`: R2's send finally REJECTS with invalid_token,
+    //      handled while cred is ALREADY access-2 but `lastSendCred` is still access-1.
+    //   4. The fix's compare-and-set (cred !== lastSendCred) → SHORT-CIRCUITS the refresh and
+    //      retries R2 with access-2. The BUG (reading live `cred`) would call refreshAndRetry
+    //      with the fresh `cred`, hit `cred === usedCred`, and fire a SECOND refresh.
+    // So `refresh` called EXACTLY ONCE is the load-bearing fix-vs-bug discriminator.
+    let releaseR2Throw: () => void = () => {};
+    const r2ThrowGate = new Promise<void>((r) => {
+      releaseR2Throw = r;
+    });
+    let refreshCalls = 0;
+    const freshHandle = fakeHandle("h2");
+    const refresh = vi.fn(async () => {
+      refreshCalls += 1;
+      return { accessToken: "access-2", dpopHandle: freshHandle };
+    });
+
+    oauthMock.responder = async (accessToken: string, url: URL): Promise<Response | Error> => {
+      if (accessToken === "access-2") return resp200(`fresh:${url.pathname}`);
+      // Stale access-1: /1 (R1) returns a bare-401; /2 (R2) THROWS — but only LATER, once the
+      // gate releases (after R1's refresh has fully landed and cred advanced to access-2).
+      if (url.pathname === "/2") {
+        await r2ThrowGate; // PARK R2's send until we release it post-R1-refresh
+        return challenge(401);
+      }
+      return resp401();
+    };
+
+    const authed = toAuthenticatedFetch(makeSession(), { refresh });
+
+    // Start R2 first so its send is dispatched (with the stale access-1) and parked on the gate.
+    const r2Promise = authed("https://pod.example/2");
+    // Let R2's send dispatch (record the call) before R1 runs.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Drive R1 fully: 401 → the single refresh lands (cred → access-2) → retry → 200.
+    const r1 = await authed("https://pod.example/1");
+    expect(r1.status).toBe(200);
+    expect(await r1.text()).toBe("fresh:/1");
+    expect(refreshCalls).toBe(1); // R1 caused the one refresh; cred is now access-2
+
+    // NOW release R2's throw: it is handled while cred(access-2) !== its snapshot(access-1).
+    releaseR2Throw();
+    const r2 = await r2Promise;
+
+    // The fix: R2 SHORT-CIRCUITS (no second refresh) and retries with the fresh access-2.
+    expect(r2.status).toBe(200);
+    expect(await r2.text()).toBe("fresh:/2");
+
+    // THE DISCRIMINATOR: exactly ONE refresh. The bug (live-`cred` read) would make this 2.
+    expect(refresh).toHaveBeenCalledTimes(1);
+    expect(refreshCalls).toBe(1);
+
+    // R2's FAILED send used the STALE access-1 (its compare-against snapshot).
+    const r2FailedSend = oauthMock.calls.find(
+      (c) => c.url.pathname === "/2" && c.accessToken === "access-1",
+    );
+    expect(r2FailedSend).toBeDefined();
+    // R2's RETRY used the fresh access-2 + fresh handle — snapshot-aware reuse, never stale reuse.
+    const r2Retry = oauthMock.calls.find(
+      (c) => c.url.pathname === "/2" && c.accessToken === "access-2",
+    );
+    expect(r2Retry).toBeDefined();
+    expect(r2Retry?.options.DPoP).toBe(freshHandle);
   });
 
   it("a refresh genuinely starts again only AFTER the first one settled (later expiry → new refresh)", async () => {

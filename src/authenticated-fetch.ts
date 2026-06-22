@@ -33,7 +33,10 @@
 //    refresh (a single shared in-flight promise), and the captured credential only ever
 //    moves FORWARD: a refresh result is committed only if `cred` has not already advanced
 //    past the credential that 401'd (compare-and-set), so a slower refresh can never clobber
-//    a newer token with an older one and force stale-token reuse.
+//    a newer token with an older one and force stale-token reuse. This holds UNIFORMLY for
+//    BOTH 401 shapes — a RETURNED bare-401 Response AND a THROWN `invalid_token` challenge —
+//    because each compares against the SNAPSHOT the failed send used, never the (possibly
+//    already-advanced) live credential.
 //  • The access/refresh tokens are NEVER logged.
 
 import * as oauth from "oauth4webapi";
@@ -257,22 +260,35 @@ export function toAuthenticatedFetch(
     // retry per call" contract instead of allowing one before AND one after the refresh.
     let nonceRetryUsed = false;
 
+    // The credential the MOST RECENT `attempt()` send used, recorded so the post-401 path can
+    // compare-and-set against the EXACT credential that failed — INCLUDING the THROWN-401 shape
+    // (oauth4webapi throws an `invalid_token` challenge rather than returning a 401 Response).
+    // Reading this snapshot instead of the live `cred` is load-bearing: between sending the
+    // request and seeing it fail, a CONCURRENT request's refresh may have advanced `cred`, so a
+    // request that failed with an OLD token must NOT be treated as if it failed with the fresh
+    // one — that would trigger a redundant refresh or skip reusing a peer's already-fresh token.
+    let lastSendCred: AuthenticatedFetchCredential = cred;
+
     // One send of the request, returning the credential it actually used alongside the
     // Response, with the (invocation-bounded) DPoP-nonce retry folded in. Resolves to a
     // Response (incl. a bare 401 a server returns without a parseable challenge) or throws.
+    // BOTH outcomes record the sending credential in `lastSendCred` first, so the thrown-401
+    // path can read the same snapshot the returned-401 path gets via `usedCred`.
     const attempt = async (): Promise<{
       res: Response;
       usedCred: AuthenticatedFetchCredential;
     }> => {
       // Snapshot the live credential ONCE per attempt so the retry's compare-and-set is
-      // against the exact credential this attempt sent with.
+      // against the exact credential this attempt sent with — recorded for the thrown path too.
       const usedCred = cred;
+      lastSendCred = usedCred;
       try {
         return { res: await send(usedCred), usedCred };
       } catch (err) {
         // One DPoP-nonce retry — but only if the per-invocation budget is unspent.
         if (oauth.isDPoPNonceError(err) && !nonceRetryUsed) {
           nonceRetryUsed = true;
+          // The nonce-retry re-sends with the SAME snapshot; `lastSendCred` already holds it.
           return { res: await send(usedCred), usedCred };
         }
         throw err;
@@ -281,6 +297,8 @@ export function toAuthenticatedFetch(
 
     // Run the request, then — ONCE — refresh-on-401 + retry. We catch both shapes of a 401:
     // a thrown WWWAuthenticateChallengeError (invalid_token) and a returned bare-401 Response.
+    // Both feed the SAME snapshot into refreshAndRetry — the returned path via `usedCred`, the
+    // thrown path via `lastSendCred` — so the compare-and-set discipline is identical for each.
     try {
       const { res, usedCred } = await attempt();
       if (res.status === 401 && refresh) {
@@ -289,8 +307,12 @@ export function toAuthenticatedFetch(
       return res;
     } catch (err) {
       if (isTokenExpiry(err) && !oauth.isDPoPNonceError(err) && refresh) {
-        // The thrown-401 path: the failed send used the live `cred` at throw time.
-        const retried = await refreshAndRetry(cred, refresh);
+        // The thrown-401 path: refresh against the SNAPSHOT the failed send actually used
+        // (`lastSendCred`), NOT the live `cred` — which a concurrent peer's refresh may have
+        // already advanced. This gives the thrown shape the SAME compare-and-set discipline as
+        // the returned-401 path (only refresh if `cred === usedCred`; `cred` only moves forward;
+        // N concurrent failures → one refresh; a peer's fresh token is reused, not re-minted).
+        const retried = await refreshAndRetry(lastSendCred, refresh);
         if (retried) return retried;
       }
       throw err;
