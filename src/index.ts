@@ -8,6 +8,13 @@
 // The CORE is everything below. The THIN per-app wiring (the provider hook +
 // the `runSilentRestore` mount effect) stays in each app — see the README.
 
+// ── The DPoP-authenticated `fetch` derived from a RestoredSession ──
+export {
+  type AuthenticatedFetchCredential,
+  type RefreshAuthenticatedFetch,
+  type ToAuthenticatedFetchOptions,
+  toAuthenticatedFetch,
+} from "./authenticated-fetch.js";
 // ── Credential-free remembered-account pointer (localStorage; key injectable) ──
 export {
   DEFAULT_REMEMBERED_ACCOUNT_KEY,

@@ -38,6 +38,7 @@ import {
   decideSilentRestore,
   shouldDropRememberedPointer,
   restoreSession,
+  toAuthenticatedFetch,
   webIdsEqual,
 } from "@jeswr/solid-session-restore";
 ```
@@ -241,6 +242,48 @@ this is standard OIDC vs a per-server workaround.
 - Lifecycle: `forgetPersisted(store, issuer)` / `clearPersisted(store, issuer)`
   (logout), `hasPersisted(store, issuer)` (tri-state: `present`/`absent`/`unknown`),
   `isInvalidGrantError(e)` (the dead-vs-transient classifier).
+
+### `toAuthenticatedFetch` — a DPoP-authenticated `fetch` from a restored session
+
+Turn a `RestoredSession` into a standard `fetch` whose every request carries
+`Authorization: DPoP <accessToken>` plus a **fresh per-request DPoP proof** signed by the
+session's bound (non-extractable) key — so apps stop hand-rolling the auth-attaching pod
+fetch and share **one** audited implementation (it was extracted from the elk fork's
+`authedFetchFromRestoredSession`).
+
+```ts
+const restored = await restoreSession({ store, issuer, clientId });
+if (!restored) return; // logged-out, no popup
+
+const authedFetch = toAuthenticatedFetch(restored, {
+  // OPTIONAL — silently re-mint a fresh access token on a 401 (token-endpoint fetch, no popup).
+  refresh: async () => restoreSession({ store, issuer, clientId }),
+  // OPTIONAL — the underlying fetch to transport bytes (default global fetch); a hook for an
+  // SSRF-guarded fetch or the reactive-auth patched global. DPoP auth is attached regardless.
+  fetch: myFetch,
+  // OPTIONAL — allow http:// for localhost/127.0.0.1/[::1] only (dev CSS). Default false.
+  allowInsecureLoopback: false,
+});
+
+// Use it like any fetch — every pod request is DPoP-authenticated.
+const res = await authedFetch("https://alice.example/private/notes");
+```
+
+The proof, the `Authorization` header, and the server **DPoP-nonce** handshake are all
+delegated to `oauth4webapi`'s `protectedResourceRequest` (driven by the session's
+`dpopHandle`) — **never** a hand-rolled proof. Bounded retries: one DPoP-nonce retry
+(RFC 9449 §8) **and** — when `refresh` is supplied — one token-refresh retry on a 401
+(both a thrown `invalid_token` challenge and a returned bare-401 are caught), after which
+the fresh credential is adopted for subsequent requests too. A failed/absent `refresh`,
+or a second 401 after a fresh token, surfaces the 401 rather than looping (**fail-closed**).
+A caller-supplied `Authorization`/`DPoP` header on the request is **stripped** so it cannot
+pin a foreign credential. The returned fetch is bound to **one** session's credential — on
+a user switch / logout, build a new authed fetch and drop the old one (this helper does not
+own that lifecycle).
+
+- `toAuthenticatedFetch(session, options?)`, `ToAuthenticatedFetchOptions`,
+  `RefreshAuthenticatedFetch`, `AuthenticatedFetchCredential` (the
+  `Pick<RestoredSession, "accessToken" | "dpopHandle">` a `refresh` returns).
 
 ## The thin per-app wiring (what each app keeps)
 

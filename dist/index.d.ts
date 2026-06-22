@@ -1,3 +1,4 @@
+export { type AuthenticatedFetchCredential, type RefreshAuthenticatedFetch, type ToAuthenticatedFetchOptions, toAuthenticatedFetch, } from "./authenticated-fetch.js";
 export { DEFAULT_REMEMBERED_ACCOUNT_KEY, RememberedAccount, type RememberedAccountRecord, } from "./remembered-account.js";
 export { clearPersisted, forgetPersisted, hasPersisted, isInvalidGrantError, type RestoredSession, type RestoreSessionOptions, restoreSession, } from "./restore-session.js";
 export { DEFAULT_DB_NAME, IndexedDbSessionStore, type IndexedDbSessionStoreOptions, indexedDbAvailable, type PersistedSession, type SessionStore, type TokenEndpointAuthMethod, } from "./session-persistence.js";

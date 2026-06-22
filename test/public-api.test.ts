@@ -55,6 +55,7 @@ describe("public API — runtime surface contract (a one-file diff for review)",
         "isInvalidGrantError": "function",
         "restoreSession": "function",
         "shouldDropRememberedPointer": "function",
+        "toAuthenticatedFetch": "function",
         "webIdsEqual": "function",
       }
     `);
